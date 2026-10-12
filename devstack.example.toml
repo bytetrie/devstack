@@ -9,8 +9,8 @@
 # Short name of this environment (lowercase, digits, '-'). Used to derive container,
 # TLD, file and volume names. Must not clash with other containers, TLDs or files
 # already on the host.
-# default: "webstack"
-name = "webstack"
+# default: "devbox"
+name = "devbox"
 
 # Host-side state and dependency policy.
 [host]
@@ -72,7 +72,8 @@ container_path = "/srv/{stack.name}"
 readonly_paths = []
 
 # Create the smoke-test app (server.ts, static/, error/, package.json, ...) in phase
-# 'app'. Existing files are kept.
+# 'app'. Existing files are kept. The project's dependencies are installed either way
+# when node_modules is missing.
 # default: true
 scaffold = true
 

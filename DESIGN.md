@@ -32,7 +32,7 @@ previous one:
    that reads files and answers requests. It's a smoke test, not the app.
 3. **Proxy** — a reverse proxy (Caddy) sits in front of the app, so the browser
    reaches it at its real intended domain plus a dev suffix
-   (`app.example.com.webstack` for a future `app.example.com`), over HTTPS with
+   (`app.example.com.devbox` for a future `app.example.com`), over HTTPS with
    a locally trusted CA, with no port numbers. Caddy serves static files
    directly and forwards `/api/*` to the app.
 4. **Standards** (client-side safety and speed) — precompressed static files,
@@ -54,11 +54,11 @@ previous one:
 | # | Phase id    | Layer     | Result                                                                                    |
 | - | ----------- | --------- | ----------------------------------------------------------------------------------------- |
 | 1 | `base`      | contain   | container, project mount (+ read-only git hooks/config), host ACL, user (limited sudo), ssh-only access, pinned IP, Node + pnpm |
-| 2 | `app`       | serve     | minimal zero-dep TypeScript smoke-test app scaffolded in the project                      |
-| 3 | `proxy`     | proxy     | Caddy + local CA, host DNS for the dev TLD, host trusts the CA                            |
-| 4 | `standards` | standards | precompressed static files, `encode`, security headers / CSP                              |
-| 5 | `isolation` | isolation | ufw, service users, nftables egress profiles, app data volume, runners, `devstack-sync`, Caddy admin socket + internal token, hardened systemd unit, header hiding |
-| 6 | `postgres`  | data      | Postgres on a **persistent incus volume**, local-only, scram auth, app role + db + test db, backups |
+| 2 | `postgres`  | data      | Postgres on a **persistent incus volume**, local-only, scram auth, app role + db + test db, backups |
+| 3 | `app`       | serve     | minimal zero-dep TypeScript smoke-test app scaffolded in the project                      |
+| 4 | `proxy`     | proxy     | Caddy + local CA, host DNS for the dev TLD, host trusts the CA                            |
+| 5 | `standards` | standards | precompressed static files, `encode`, security headers / CSP                              |
+| 6 | `isolation` | isolation | ufw, service users, nftables egress profiles, app data volume, runners, `devstack-sync`, Caddy admin socket + internal token, hardened systemd unit, header hiding |
 
 The tool is the **repro recipe**: the project's git repo (with its
 `infra/devstack-requires.toml`) + this folder + a personal `devstack.toml` made
@@ -288,7 +288,7 @@ be reused is a key, derived from `stack.name` by default:
 
 | What                                                                                         | Key                             | Default                                                      |
 | -------------------------------------------------------------------------------------------- | ------------------------------- | ------------------------------------------------------------ |
-| stack name (root of all names)                                                               | `stack.name`                    | `webstack`                                                   |
+| stack name (root of all names)                                                               | `stack.name`                    | `devbox`                                                   |
 | container                                                                                    | `container.name`                | `{stack.name}`                                               |
 | dev TLD (all `*.tld` → container); must not be a delegated TLD unless `dns.allow_public_tld` | `dns.tld`                       | `{container.name}`                                           |
 | app hostname (prod) / dev URL                                                                | `site.hostname`                 | `app.example.com` → `https://app.example.com.{dns.tld}`      |
@@ -646,7 +646,7 @@ corepack), `tsconfig.json`, `infra/apt-packages.txt` (format header only),
 `scripts/sync-env.sh` (`sudo devstack-sync packages < infra/apt-packages.txt`,
 then `pnpm install --frozen-lockfile`), `server.ts` (zero deps; binds `app.bind`:`app.port`,
 default 127.0.0.1:8080; `/api/health`; token middleware is present but only
-enforced when `INTERNAL_TOKEN` is set, so phase 2 runs before phase 5 exists;
+enforced when `INTERNAL_TOKEN` is set, so `app` runs before `isolation` exists;
 with `NODE_ENV=production`, which the systemd unit sets, a missing token fails
 closed: every request gets a bare 500), `static/{index.html,style.css,main.js}`,
 `error/index.html`, `.gitignore`, and `README.md` (which carries the dependency
@@ -655,9 +655,12 @@ machine-readable inventory is generated into `<sbom.dir>/`, see §8.7). Then
 (C) as the user: `corepack use pnpm@<node.pnpm_version>` and `pnpm add -D` of
 `dev_packages()` if `package.json` was just created; for an existing project without `node_modules` (a clone, or a rebuild:
 undo removes the `node_modules` devstack created), `pnpm install
---frozen-lockfile` (plain `install` without a lockfile). Verify:
-`node --check`-style dry start of `server.ts` on the port, curl `/api/health`
-from inside the container, stop.
+--frozen-lockfile` (plain `install` without a lockfile). The install runs with
+`project.scaffold = false` too: a rebuild of such a project still needs its
+dependencies. Verify: `node --check`-style dry start of `server.ts` on the port,
+curl `/api/health` from inside the container, stop. Only for the scaffolded app:
+with `project.scaffold = false` the app may need what only its systemd unit gets
+(secrets, `$STATE_DIRECTORY`), so `isolation` starts and checks it.
 
 **The project toolchain** (only with a new `package.json`: `SCAFFOLD_NEW_PROJECT_ONLY`).
 A new project gets `pnpm-workspace.yaml`, `eslint.config.js` and
@@ -694,7 +697,7 @@ against its release-age and trust rules, which could fail a rebuild.
 
 Note: from the start the server binds **127.0.0.1**, not 0.0.0.0 (the top
 isolation rule, §1.1), so it can't be opened at `http://<container-ip>:8080`;
-the inside-container curl checks it instead. Browser access comes with phase 3.
+the inside-container curl checks it instead. Browser access comes with `proxy`.
 
 ### 8.3 `proxy`
 
@@ -910,6 +913,13 @@ can't reach by design.
     mounts, apt repos, sudo, ACL exceptions. When devstack changes the template,
     `up` reinstalls it on an existing container whose isolation phase is done
     (`refresh_sync`): the same script a fresh isolation run would install.
+
+    It is installed before the app unit (step 8), and the phase then feeds it the
+    project's `infra/apt-packages.txt` (`install_project_packages`): read as the
+    container user, piped to `devstack-sync packages` as root, so a rebuild gets
+    the packages back without anyone running `scripts/sync-env.sh`. A failure
+    only warns: a bad line in a project file shouldn't roll back the isolation
+    phase.
 11. Verify: `systemd-analyze security` score logged; `ss -tlnp` shows the app
     only on 127.0.0.1; direct request without token → 500; through Caddy → 200;
     no `Server` header; `ufw status` as expected. As each service user: the app
@@ -942,7 +952,7 @@ can't reach by design.
 5. (C) `conf.d/10-devstack.conf`: `listen_addresses = 'localhost'`,
    `password_encryption = scram-sha-256`; replace `pg_hba.conf` with: postgres
    via peer on the local socket, everyone else scram-sha-256 on socket and
-   127.0.0.1/::1 only. ufw deny 5432 (already in phase 5 list).
+   127.0.0.1/::1 only. ufw deny 5432 (already in the `isolation` list).
 6. (C) secret `postgres.env` (`DATABASE_URL=…`, `PG*` vars) generated once;
    role + db created if missing, password set (via psql stdin, `\gexec`, never
    argv). If the role already existed (reused volume) its password is reset to
@@ -955,10 +965,19 @@ can't reach by design.
    so root never writes through a path the user controls) has `DATABASE_URL`
    and `TEST_DATABASE_URL` for dev tools (`node --env-file-if-exists=…`). The
    app unit still only gets `postgres.env`.
-8. (C) add `EnvironmentFile=<secrets>/postgres.env` to the app unit, restart;
-   `/api/health` reports db reachability.
+8. (C) the app unit reads `EnvironmentFile=-<secrets>/postgres.env`; restart it
+   if `isolation` is done (a redo, or a stack built in the old order).
 9. Verify: `pg_isready`, login as app role over 127.0.0.1 (and into the test
-   db), `ss` shows 5432 on loopback only, `/api/health` → `"db": true`.
+   db), `ss` shows 5432 on loopback only; `/api/health` → `"db": true` if
+   `isolation` is done, else `isolation` checks it when it starts the unit.
+
+Order: `postgres` runs second, right after `base`, so `DATABASE_URL` exists
+before the app first starts as a unit. It used to run last, which made any app
+that refuses to start without its database unbuildable from scratch. Stacks
+built in that order have `postgres` applied after `isolation`; undo, `undo --to`
+and `up --redo` follow the order phases were applied (`active_phases()`, from
+the `state.json` timestamps), never `PHASES` order, because each phase's
+snapshot predates everything applied after it.
 
 Backups: `devstack db backup` streams `pg_dump -Fc` over `incus exec` to
 `postgres.backup_dir/<db>-<timestamp>.dump`; automatic before undoing `postgres`
@@ -1158,8 +1177,8 @@ address=/<tld>/<ip>              # dns.wildcard = true: <tld> and every *.<tld>
 host-record=<name>,<ip>          # one per dns.extra_names (exact names only)
 ```
 
-- `dns.tld` (default `{container.name}`, e.g. `webstack`) lets you use the full
-  intended domain (`app.example.com.webstack`) against the container.
+- `dns.tld` (default `{container.name}`, e.g. `devbox`) lets you use the full
+  intended domain (`app.example.com.devbox`) against the container.
 - `dns.tld` must not end in a delegated TLD (`public_tld_problem`, checked in
   `validate()` against the bundled `data/iana-tlds.txt` snapshot):
   `address=/com/ip` would hijack every `.com` name on the host. `home.arpa` is

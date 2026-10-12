@@ -52,7 +52,7 @@ def make_ctx(tmp: Path, runner=None, **overrides: object) -> "ds.Ctx":
         "host.state_dir": str(tmp / "state"),
         "project.host_path": str(tmp / "project"),
         "ssh.key_path": str(tmp / "ssh" / "key"),
-        "ssh.known_hosts_file": str(tmp / "ssh" / "known_hosts.d" / "devstack-webstack"),
+        "ssh.known_hosts_file": str(tmp / "ssh" / "known_hosts.d" / "devstack-devbox"),
         **overrides,
     })
     args = argparse.Namespace(yes=False)
@@ -66,9 +66,9 @@ def make_ctx(tmp: Path, runner=None, **overrides: object) -> "ds.Ctx":
 class ConfigTests(unittest.TestCase):
     def test_defaults_resolve_and_validate(self):
         cfg = make_config()
-        self.assertEqual(cfg["container.name"], "webstack")
-        self.assertEqual(cfg.dev_host, "app.example.com.webstack")
-        self.assertEqual(cfg["postgres.db"], "webstack")
+        self.assertEqual(cfg["container.name"], "devbox")
+        self.assertEqual(cfg.dev_host, "app.example.com.devbox")
+        self.assertEqual(cfg["postgres.db"], "devbox")
 
     def test_stack_name_derives_everything(self):
         cfg = make_config(**{"stack.name": "my-app"})
@@ -97,12 +97,12 @@ class ConfigTests(unittest.TestCase):
 
     def test_example_file_is_valid(self):
         cfg = ds.load_config(ROOT / "devstack.example.toml")
-        self.assertEqual(cfg["stack.name"], "webstack")
+        self.assertEqual(cfg["stack.name"], "devbox")
 
     def test_toml_roundtrip(self):
         text = ds.config_to_toml(ds.defaults())
         import tomllib
-        self.assertEqual(tomllib.loads(text)["stack"]["name"], "webstack")
+        self.assertEqual(tomllib.loads(text)["stack"]["name"], "devbox")
 
 
 class TldTests(unittest.TestCase):
@@ -113,7 +113,7 @@ class TldTests(unittest.TestCase):
                 make_config(**{"dns.tld": tld})
 
     def test_safe_names_accepted(self):
-        for tld in ("webstack", "internal", "home.arpa", "test", "localhost", ""):
+        for tld in ("devbox", "internal", "home.arpa", "test", "localhost", ""):
             self.assertIsNone(ds.public_tld_problem(tld), tld)
 
     def test_escape_hatch(self):
@@ -128,7 +128,7 @@ class TldTests(unittest.TestCase):
         tlds = ds.delegated_tlds()
         self.assertGreater(len(tlds), 1000)
         self.assertIn("com", tlds)
-        self.assertNotIn("webstack", tlds)
+        self.assertNotIn("devbox", tlds)
         self.assertNotIn("internal", tlds)
 
 
@@ -299,8 +299,8 @@ class JournalAndUndoTests(unittest.TestCase):
         ctx = make_ctx(self.tmp, FakeRunner())
         cfgfile = self.tmp / "ssh_config"
         cfgfile.write_text("Host other\n    User x\n")
-        ctx.set_marked_block(cfgfile, "Host webstack\n    User y")
-        self.assertIn("Host webstack", cfgfile.read_text())
+        ctx.set_marked_block(cfgfile, "Host devbox\n    User y")
+        self.assertIn("Host devbox", cfgfile.read_text())
         entry = ctx.journal.find("marked_block", ds.ACTIVE)
         ds.UNDO["marked_block"](ctx, entry["args"], ds.UndoOpts())
         self.assertEqual(cfgfile.read_text(), "Host other\n    User x\n")
@@ -400,9 +400,9 @@ class JournalAndUndoTests(unittest.TestCase):
     def test_purged_volume_waits_for_the_container(self):
         runner = FakeRunner()
         ctx = make_ctx(self.tmp, runner)
-        args = {"pool": "default", "volume": "webstack-pgdata", "adopted": False}
+        args = {"pool": "default", "volume": "devbox-pgdata", "adopted": False}
         purge_all = ds.UndoOpts(purge_data=True, whole=True)
-        used = {"used_by": ["/1.0/instances/webstack"]}
+        used = {"used_by": ["/1.0/instances/devbox"]}
         ctx.iq = lambda path: used
         self.assertEqual(ds.UNDO["incus_volume"](ctx, args, purge_all), "kept")  # still attached: later
         self.assertEqual(runner.calls, [])
@@ -411,7 +411,7 @@ class JournalAndUndoTests(unittest.TestCase):
             ds.UNDO["incus_volume"](ctx, args, purge_all)
         used["used_by"] = []
         self.assertEqual(ds.UNDO["incus_volume"](ctx, args, purge_all), "undone")
-        self.assertEqual(runner.calls, [["incus", "storage", "volume", "delete", "default", "webstack-pgdata"]])
+        self.assertEqual(runner.calls, [["incus", "storage", "volume", "delete", "default", "devbox-pgdata"]])
 
     def test_data_backup_skipped_when_nothing_is_attached(self):
         ctx = make_ctx(self.tmp, FakeRunner())
@@ -422,7 +422,7 @@ class JournalAndUndoTests(unittest.TestCase):
         try:
             ds.maybe_backup_data(ctx, required=True)  # nothing to archive, nothing of ours to lose
             self.assertEqual(backups, [])
-            e = ctx.journal.add("isolation", "incus_volume", pool="default", volume="webstack-appdata", adopted=False)
+            e = ctx.journal.add("isolation", "incus_volume", pool="default", volume="devbox-appdata", adopted=False)
             ctx.journal.mark(e, "applied")
             ctx.volume = lambda name=None: {"name": name}
             with self.assertRaises(ds.DevstackError):  # ours, exists, detached: a purge must not take it unarchived
@@ -451,6 +451,60 @@ class JournalAndUndoTests(unittest.TestCase):
         for rel in ds.SCAFFOLD_NEW_PROJECT_ONLY:  # no lint config for packages it doesn't have
             self.assertFalse((ctx.project / rel).exists(), rel)
 
+    def test_app_phase_installs_dependencies_without_scaffold(self):
+        runner = FakeRunner()
+        ctx = make_ctx(self.tmp, runner, **{"project.scaffold": False})
+        ctx.phase = "app"
+        ds.PHASE_BY_ID["app"].apply(ctx)
+        self.assertFalse(any("pnpm" in " ".join(c) for c in runner.calls))  # no package.json: nothing to install
+        (ctx.project / "package.json").write_text('{"dependencies": {"hono": "^4.0.0"}}\n')
+        (ctx.project / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n")
+        ds.PHASE_BY_ID["app"].apply(ctx)  # a rebuild: destroy removed the node_modules devstack installed
+        scripts = [" ".join(c) for c in runner.calls if "pnpm" in " ".join(c)]
+        self.assertEqual(len(scripts), 1)
+        self.assertIn("pnpm install --frozen-lockfile", scripts[0])
+        self.assertFalse((ctx.project / "server.ts").exists())  # still nothing scaffolded
+
+    def test_isolation_installs_the_projects_apt_packages(self):
+        class Runner(FakeRunner):
+            def __init__(self, listing, sync_rc=0):
+                super().__init__()
+                self.listing, self.sync_rc, self.inputs = listing, sync_rc, []
+
+            def run(self, argv, *, check=True, sudo=False, input=None, **kw):
+                argv = [str(a) for a in argv]
+                self.calls.append(argv)
+                self.inputs.append(input)
+                if "runuser" in argv:  # reading the list, as the container user
+                    if self.listing is None:
+                        return subprocess.CompletedProcess(argv, 44, "", "")
+                    return subprocess.CompletedProcess(argv, 0, self.listing, "")
+                return subprocess.CompletedProcess(argv, self.sync_rc, "", "")
+
+        runner = Runner("ffmpeg  # runners\ngit\n")
+        ctx = make_ctx(self.tmp, runner)
+        ds.install_project_packages(ctx)
+        self.assertEqual(len(runner.calls), 2)
+        self.assertIn("runuser", runner.calls[0])  # never read as root: it may be a symlink
+        self.assertNotIn("runuser", runner.calls[1])
+        self.assertEqual(runner.calls[1][-1], f"{ds.SYNC_PATH} packages")
+        self.assertEqual(runner.inputs[1], "ffmpeg  # runners\ngit\n")  # devstack-sync validates it
+
+        runner = Runner(None)
+        ds.install_project_packages(make_ctx(self.tmp, runner))
+        self.assertEqual(len(runner.calls), 1)  # no list: nothing to install
+
+        runner = Runner("not-a-package\n", sync_rc=1)
+        with self.assertLogs(ds.log, "WARNING"):
+            ds.install_project_packages(make_ctx(self.tmp, runner))  # warns, doesn't raise
+
+    def test_app_phase_leaves_an_unscaffolded_app_to_isolation(self):
+        runner = FakeRunner()
+        ctx = make_ctx(self.tmp, runner, **{"project.scaffold": False})
+        (ctx.project / "server.ts").write_text("process.exit(1);\n")  # needs what only its unit provides
+        ds.PHASE_BY_ID["app"].verify(ctx)
+        self.assertEqual(runner.calls, [])  # no smoke test run
+
     def test_app_phase_scaffolds_the_toolchain_for_a_new_project(self):
         runner = FakeRunner()
         ctx = make_ctx(self.tmp, runner)
@@ -471,6 +525,34 @@ class JournalAndUndoTests(unittest.TestCase):
         ds.undo_phase(ctx, ds.PHASE_BY_ID["app"], ds.UndoOpts())
         self.assertEqual(ctx.journal.entries[-1]["status"], "undone")
         self.assertEqual(ctx.state.status("app"), "pending")
+
+    def test_postgres_runs_before_the_app_needs_it(self):
+        ids = [p.id for p in ds.PHASES]
+        self.assertLess(ids.index("postgres"), ids.index("app"))
+        self.assertLess(ids.index("postgres"), ids.index("isolation"))
+
+    def _done_at(self, ctx, order):
+        for i, pid in enumerate(order):
+            ctx.state.data["phases"][pid] = {"status": "done", "ts": f"2026-10-05T15:{i:02d}:00-04:00"}
+
+    def test_undo_follows_the_order_phases_were_applied(self):
+        ctx = make_ctx(self.tmp, FakeRunner())
+        legacy = ["base", "app", "proxy", "standards", "isolation", "postgres"]  # built before postgres moved up
+        self._done_at(ctx, legacy)
+        self.assertEqual([p.id for p in ds.active_phases(ctx)], legacy)
+        self.assertEqual([p.id for p in ds.applied_from(ctx, "isolation", inclusive=False)], ["postgres"])
+        self.assertEqual([p.id for p in ds.applied_from(ctx, "isolation")], ["isolation", "postgres"])
+        args = argparse.Namespace(to=None, only=None, redo="isolation")
+        self.assertEqual([p.id for p in ds.selected_phases(ctx, args)], ["postgres", "isolation"])
+
+    def test_undo_order_on_a_new_stack(self):
+        ctx = make_ctx(self.tmp, FakeRunner())
+        self._done_at(ctx, [p.id for p in ds.PHASES])
+        self.assertEqual(ds.active_phases(ctx), ds.PHASES)
+        self.assertEqual([p.id for p in ds.applied_from(ctx, "postgres", inclusive=False)],
+                         ["app", "proxy", "standards", "isolation"])
+        args = argparse.Namespace(to=None, only=None, redo="standards")
+        self.assertEqual([p.id for p in ds.selected_phases(ctx, args)], ["standards", "isolation"])
 
 
 class RequirementsTests(unittest.TestCase):
@@ -566,7 +648,7 @@ class CaddyfileTests(unittest.TestCase):
                 project = ds.caddyfile(ctx, level)
                 self.assertFalse(ds.caddyfile_has_global_block(project), level)
                 self.assertNotIn("admin", project)
-                self.assertIn("app.example.com.webstack {", project)
+                self.assertIn("app.example.com.devbox {", project)
 
     def test_global_block_detection(self):
         self.assertTrue(ds.caddyfile_has_global_block("# comment\n\n  {\n\tadmin localhost:2019\n}\n"))
@@ -714,10 +796,10 @@ class DevServerTests(unittest.TestCase):
             self.assertNotIn("reverse_proxy localhost:", ds.caddy_global(ctx, ds.LEVEL_ISOLATION))
             ctx = make_ctx(Path(d), FakeRunner(), **{"caddy.dev_servers": {"vite": "5173"}})
             glob = ds.caddy_global(ctx, ds.LEVEL_ISOLATION)
-            block = glob[glob.index("vite.app.example.com.webstack {"):]
+            block = glob[glob.index("vite.app.example.com.devbox {"):]
             block = block[:block.index("\n}\n")]
-            self.assertLess(glob.index("(devstack_same_origin)"), glob.index("vite.app.example.com.webstack {"))
-            self.assertLess(glob.index("vite.app.example.com.webstack {"), glob.index("import /"))
+            self.assertLess(glob.index("(devstack_same_origin)"), glob.index("vite.app.example.com.devbox {"))
+            self.assertLess(glob.index("vite.app.example.com.devbox {"), glob.index("import /"))
             self.assertIn("\timport devstack_same_origin", block)
             self.assertIn("reverse_proxy /api/* 127.0.0.1:8080 {", block)
             self.assertIn("X-Internal-Token", block)
@@ -730,9 +812,9 @@ class DevServerTests(unittest.TestCase):
     def test_dns_records_when_not_wildcard(self):
         with tempfile.TemporaryDirectory() as d:
             ctx = make_ctx(Path(d), FakeRunner(), **{"caddy.dev_servers": {"vite": "5173"}})
-            self.assertEqual(ds.ProxyPhase._dns_lines(ctx, "10.0.0.2"), ["address=/webstack/10.0.0.2"])
+            self.assertEqual(ds.ProxyPhase._dns_lines(ctx, "10.0.0.2"), ["address=/devbox/10.0.0.2"])
             ctx = make_ctx(Path(d), FakeRunner(), **{"caddy.dev_servers": {"vite": "5173"}, "dns.wildcard": False})
-            self.assertIn("host-record=vite.app.example.com.webstack,10.0.0.2",
+            self.assertIn("host-record=vite.app.example.com.devbox,10.0.0.2",
                           ds.ProxyPhase._dns_lines(ctx, "10.0.0.2"))
 
 
@@ -899,7 +981,7 @@ class CheckpointOrchestrationTests(unittest.TestCase):
             "commit": "c" * 40, "head": "h" * 40, "branch": "main", "files": 3, "skipped": [],
             "ignored_files": 0, "ignored_bytes": 0, "uncaptured": []})
         ds.pool_space = lambda ctx: (1000, 10**12)
-        ds.checkpoint_volumes = lambda ctx: ["webstack-pgdata"]
+        ds.checkpoint_volumes = lambda ctx: ["devbox-pgdata"]
         ds.volume_snapshot_exists = lambda ctx, v, s: True
         ds.git_run = lambda ctx, *a, **kw: b""
 
@@ -924,12 +1006,12 @@ class CheckpointOrchestrationTests(unittest.TestCase):
         self.assertEqual(ds.checkpoint_create(self.ctx, "one"), 0)
         self.assertEqual(self.incus(), [
             ["STOP"], ["CAPTURE", "False"],
-            ["incus", "snapshot", "create", "webstack"],
+            ["incus", "snapshot", "create", "devbox"],
             ["incus", "storage", "volume", "snapshot"],
-            ["incus", "start", "webstack"]])
+            ["incus", "start", "devbox"]])
         meta = ds.checkpoint_metas(self.ctx)[0]
         self.assertEqual(meta["phases"], [p.id for p in ds.PHASES])
-        self.assertEqual(meta["volumes"], ["webstack-pgdata"])
+        self.assertEqual(meta["volumes"], ["devbox-pgdata"])
         self.assertEqual((self.ctx.state_dir / "checkpoints" / "one").stat().st_mode & 0o777, 0o700)
 
     def test_keep_one_makes_the_new_one_before_deleting_the_old(self):
@@ -938,7 +1020,7 @@ class CheckpointOrchestrationTests(unittest.TestCase):
         self.runner.calls.clear()
         ds.checkpoint_create(self.ctx, "two")
         cmds = [" ".join(c[:4]) for c in self.runner.calls if c[0] == "incus"]
-        self.assertLess(cmds.index("incus snapshot create webstack"), cmds.index("incus snapshot delete webstack"))
+        self.assertLess(cmds.index("incus snapshot create devbox"), cmds.index("incus snapshot delete devbox"))
         self.assertEqual([m["name"] for m in ds.checkpoint_metas(self.ctx)], ["two"])
 
     def test_dropping_an_old_one_needs_a_yes(self):
@@ -995,18 +1077,18 @@ class CheckpointOrchestrationTests(unittest.TestCase):
 
 class DnsRefreshTests(unittest.TestCase):
     def test_dev_server_added_later_gets_its_record_without_a_phase_rerun(self):
-        """learn-sys: dns.wildcard = false, proxy done, then vite added. Only app.<tld> resolved."""
+        """dns.wildcard = false, proxy done, then vite added. Only app.<tld> resolved."""
         with tempfile.TemporaryDirectory() as d:
             runner = FakeRunner()
-            conf = Path(d) / "devstack-webstack.conf"
+            conf = Path(d) / "devstack-devbox.conf"
             ctx = make_ctx(Path(d), runner, **{"dns.wildcard": False, "dns.dnsmasq_dir": d, "dns.dnsmasq_file": str(conf),
                                                 "caddy.dev_servers": {"vite": "5173"}})
             ctx.state.set_fact("ipv4", "10.0.0.2")
-            conf.write_text("# devstack:webstack — generated\nhost-record=app.example.com.webstack,10.0.0.2\n")
+            conf.write_text("# devstack:devbox — generated\nhost-record=app.example.com.devbox,10.0.0.2\n")
             self.assertFalse(ds.pending_dns(ctx))  # proxy not done: the phase writes it
             ctx.state.set_status("proxy", "done")
             self.assertTrue(ds.pending_dns(ctx))
-            self.assertIn("host-record=vite.app.example.com.webstack,10.0.0.2", ds.dns_body(ctx, "10.0.0.2"))
+            self.assertIn("host-record=vite.app.example.com.devbox,10.0.0.2", ds.dns_body(ctx, "10.0.0.2"))
             self.assertTrue(ds.refresh_dns(ctx))
             self.assertEqual(ctx.phase, "proxy")
             self.assertTrue(any(c[:2] == ["sudo", "install"] and str(conf) in c for c in runner.calls))
@@ -1023,25 +1105,25 @@ class BrowseTests(unittest.TestCase):
     def test_confinement_flags(self):
         with tempfile.TemporaryDirectory() as d:
             ctx = self.ctx(d)
-            argv = ds.browser_argv(ctx, "chromium", "https://app.example.com.webstack/", False)
-            self.assertEqual(argv[-1], "https://app.example.com.webstack/")  # a normal window by default
+            argv = ds.browser_argv(ctx, "chromium", "https://app.example.com.devbox/", False)
+            self.assertEqual(argv[-1], "https://app.example.com.devbox/")  # a normal window by default
             self.assertIn("--proxy-server=http://127.0.0.1:9", argv)
-            self.assertIn("--proxy-bypass-list=*.webstack;<-loopback>", argv)  # loopback is NOT bypassed
+            self.assertIn("--proxy-bypass-list=*.devbox;<-loopback>", argv)  # loopback is NOT bypassed
             self.assertIn("--force-webrtc-ip-handling-policy=disable_non_proxied_udp", argv)
             self.assertIn("--disable-extensions", argv)
             self.assertIn(f"--user-data-dir={ctx.state_dir / 'browser' / 'profile'}", argv)
-            self.assertEqual(ds.browser_argv(ctx, "chromium", "https://x.webstack/", True)[-1], "--app=https://x.webstack/")
+            self.assertEqual(ds.browser_argv(ctx, "chromium", "https://x.devbox/", True)[-1], "--app=https://x.devbox/")
             single = self.ctx(d, **{"dns.tld": "", "dns.extra_names": ["api.example.com"]})
             self.assertEqual(ds.dev_domains(single.cfg), ["app.example.com", "*.app.example.com", "api.example.com"])
 
     def test_targets_stay_in_the_dev_domain(self):
         with tempfile.TemporaryDirectory() as d:
             ctx = self.ctx(d)
-            self.assertEqual(ds.browser_target(ctx, None), "https://app.example.com.webstack/")
-            self.assertEqual(ds.browser_target(ctx, "vite"), "https://vite.app.example.com.webstack/")
-            self.assertEqual(ds.browser_target(ctx, "other.webstack/x"), "https://other.webstack/x")
-            for bad in ("example.com", "https://webstack.evil.com/", "file:///etc/passwd", "http://127.0.0.1:5173/",
-                        "https://evilwebstack/", "javascript:alert(1)"):
+            self.assertEqual(ds.browser_target(ctx, None), "https://app.example.com.devbox/")
+            self.assertEqual(ds.browser_target(ctx, "vite"), "https://vite.app.example.com.devbox/")
+            self.assertEqual(ds.browser_target(ctx, "other.devbox/x"), "https://other.devbox/x")
+            for bad in ("example.com", "https://devbox.evil.com/", "file:///etc/passwd", "http://127.0.0.1:5173/",
+                        "https://evildevbox/", "javascript:alert(1)"):
                 with self.assertRaises(ds.ConfigError, msg=bad):
                     ds.browser_target(ctx, bad)
 
@@ -1111,7 +1193,7 @@ class BrowseTests(unittest.TestCase):
                 ds.launch_detached, ds.dead_proxy_free, ds.ensure_browser_trust, ds.shutil.which = saved
             argv, env, log_path = launched[0]
             self.assertEqual(argv[0], "chromium")
-            self.assertEqual(argv[-1], "https://vite.app.example.com.webstack/")
+            self.assertEqual(argv[-1], "https://vite.app.example.com.devbox/")
             self.assertEqual(env["HOME"], str(ctx.state_dir / "browser"))
             self.assertEqual((ctx.state_dir / "browser").stat().st_mode & 0o777, 0o700)
 
@@ -1132,9 +1214,9 @@ class CaTests(unittest.TestCase):
             text = subprocess.run(["openssl", "x509", "-in", root, "-noout", "-text"], capture_output=True,
                                   text=True, check=True).stdout
             self.assertIn("Name Constraints: critical", text)
-            self.assertIn("DNS:.webstack", text)
+            self.assertIn("DNS:.devbox", text)
             # leaf for the dev domain verifies, leaf for another site is rejected by the name constraint
-            for host, ok in (("app.example.com.webstack", True), ("bank.example.com", False)):
+            for host, ok in (("app.example.com.devbox", True), ("bank.example.com", False)):
                 key, csr, crt = tmp / "k.pem", tmp / "r.csr", tmp / "l.crt"
                 ext = tmp / "ext.cnf"
                 ext.write_text(f"subjectAltName=DNS:{host}\nbasicConstraints=CA:FALSE\n")
@@ -1190,10 +1272,10 @@ class IsolationConfigTests(unittest.TestCase):
         self.assertEqual(cfg["container.sudo"], "limited")
         self.assertEqual(cfg["app.profile"], "local")
         self.assertEqual(cfg["app.data"], "volume")
-        self.assertEqual(cfg["app.data_volume"], "webstack-appdata")
-        self.assertEqual(cfg["postgres.test_db"], "webstack_test")
+        self.assertEqual(cfg["app.data_volume"], "devbox-appdata")
+        self.assertEqual(cfg["postgres.test_db"], "devbox_test")
         self.assertEqual(cfg["project.readonly_paths"], [])
-        self.assertEqual(cfg["network.acl_name"], "devstack-webstack")
+        self.assertEqual(cfg["network.acl_name"], "devstack-devbox")
         self.assertEqual(ds.isolation_ids(cfg), {"app_uid": 510, "runner_uid": 511, "data_gid": 512, "dev_gid": 513})
 
     def test_runner_defaults_are_filled_in(self):
@@ -1226,7 +1308,7 @@ class IsolationConfigTests(unittest.TestCase):
         with self.assertRaises(ds.ConfigError):
             make_config(**{"isolation.system_uid_base": 498})  # 498-501 overlaps postgres 500
         with self.assertRaises(ds.ConfigError):
-            make_config(**{"postgres.test_db": "webstack"})
+            make_config(**{"postgres.test_db": "devbox"})
         with self.assertRaises(ds.ConfigError):
             make_config(**{"network.allow_private": ["192.168.1.300/32"]})
         with self.assertRaises(ds.ConfigError):
@@ -1283,10 +1365,10 @@ class IsolationRenderTests(unittest.TestCase):
     def test_app_unit(self):
         with tempfile.TemporaryDirectory() as d:
             unit = ds.render("system/app.service", self.ctx(d).tvars())
-            self.assertIn("User=webstack-app\n", unit)
-            self.assertIn("Group=webstack-data\n", unit)
+            self.assertIn("User=devbox-app\n", unit)
+            self.assertIn("Group=devbox-data\n", unit)
             self.assertIn("Requires=devstack-egress.service", unit)
-            self.assertIn("StateDirectory=webstack-app\n", unit)
+            self.assertIn("StateDirectory=devbox-app\n", unit)
             self.assertIn("UMask=0027", unit)
             for directive in ("IPAddressDeny=", "IPAddressAllow=", "DynamicUser="):
                 self.assertNotRegex(unit, rf"(?m)^{directive}", directive)
@@ -1327,28 +1409,28 @@ class IsolationRenderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             ctx = self.ctx(d, **{"app.runners": [RUNNER]})
             units = ds.runner_units(ctx.cfg, ctx.tvars())
-            sock = units["/etc/systemd/system/webstack-fetch.socket"]
-            svc = units["/etc/systemd/system/webstack-fetch@.service"]
+            sock = units["/etc/systemd/system/devbox-fetch.socket"]
+            svc = units["/etc/systemd/system/devbox-fetch@.service"]
             self.assertIn("ListenStream=127.0.0.1:9101", sock)
             self.assertIn("Accept=yes", sock)
             self.assertIn("MaxConnections=4", sock)
             self.assertIn("ExecStart=node scripts/runner.ts", svc)
-            self.assertIn("User=webstack-runner", svc)
-            self.assertIn("ReadWritePaths=/var/lib/webstack-app/incoming", svc)
-            self.assertIn("InaccessiblePaths=-/srv/webstack/.git", svc)
+            self.assertIn("User=devbox-runner", svc)
+            self.assertIn("ReadWritePaths=/var/lib/devbox-app/incoming", svc)
+            self.assertIn("InaccessiblePaths=-/srv/devbox/.git", svc)
             self.assertNotRegex(svc, r"(?m)^EnvironmentFile=")
-            self.assertNotIn("webstack-data", svc)  # not in the data group
+            self.assertNotIn("devbox-data", svc)  # not in the data group
             for text in units.values():
                 self.assertNotIn("@@", text)
             nodata = self.ctx(d, **{"app.runners": [RUNNER], "app.data": "none"})
-            svc = ds.runner_units(nodata.cfg, nodata.tvars())["/etc/systemd/system/webstack-fetch@.service"]
+            svc = ds.runner_units(nodata.cfg, nodata.tvars())["/etc/systemd/system/devbox-fetch@.service"]
             self.assertNotIn("ReadWritePaths", svc)
 
     def test_sudoers_line(self):
-        script = ds.bash(ds.SUDO_APPLY, USER="alice", MODE="limited", DROPIN="/etc/sudoers.d/devstack-webstack")
+        script = ds.bash(ds.SUDO_APPLY, USER="alice", MODE="limited", DROPIN="/etc/sudoers.d/devstack-devbox")
         self.assertIn("ALL=(root) NOPASSWD: /usr/local/sbin/devstack-sync", script)
         self.assertIn("visudo -qcf", script)
-        self.assertEqual(ds.sudoers_dropin(make_config()), "/etc/sudoers.d/devstack-webstack")
+        self.assertEqual(ds.sudoers_dropin(make_config()), "/etc/sudoers.d/devstack-devbox")
 
 
 class DevstackSyncTests(unittest.TestCase):
@@ -1368,8 +1450,8 @@ class DevstackSyncTests(unittest.TestCase):
         self.assertEqual(subprocess.run(["bash", "-n", self.script]).returncode, 0)
         text = self.script.read_text()
         self.assertNotIn("@@", text)
-        self.assertIn("app_unit=webstack-app.service", text)
-        self.assertIn("runner_sockets=(webstack-fetch.socket)", text)
+        self.assertIn("app_unit=devbox-app.service", text)
+        self.assertIn("runner_sockets=(devbox-fetch.socket)", text)
 
     def test_validate_caddy_needs_root_and_takes_only_caddy(self):
         if os.getuid() == 0:
@@ -1468,29 +1550,29 @@ class AclTests(unittest.TestCase):
             ds.ensure_acl(ctx)
             self.assertEqual(runner.calls[1][:5], ["incus", "query", "-X", "POST", "/1.0/network-acls"])
             body = json.loads(runner.calls[1][6])
-            self.assertEqual(body["name"], "devstack-webstack")
+            self.assertEqual(body["name"], "devstack-devbox")
             self.assertEqual(body["ingress"], [])
-            self.assertIn(["incus", "config", "device", "set", "webstack", "eth0", "security.acls=devstack-webstack",
+            self.assertIn(["incus", "config", "device", "set", "devbox", "eth0", "security.acls=devstack-devbox",
                            "security.acls.default.ingress.action=allow", "security.acls.default.egress.action=allow"],
                           runner.calls)
-            self.assertTrue(ctx.journal.owns("incus_acl", name="devstack-webstack"))
+            self.assertTrue(ctx.journal.owns("incus_acl", name="devstack-devbox"))
 
     def test_acl_undo_detaches_then_deletes_and_checks_name(self):
         with tempfile.TemporaryDirectory() as d:
             runner = FakeRunner()
             ctx = self.acl_ctx(d, runner, acl_exists=True)
-            devices = {"eth0": {"type": "nic", "security.acls": "devstack-webstack",
+            devices = {"eth0": {"type": "nic", "security.acls": "devstack-devbox",
                                 "security.acls.default.ingress.action": "allow"}}
             ctx.instance = lambda name=None: {"devices": devices}
-            args = {"name": "someone-elses", "instance": "webstack", "nic": "eth0"}
+            args = {"name": "someone-elses", "instance": "devbox", "nic": "eth0"}
             self.assertEqual(ds.UNDO["incus_acl"](ctx, args, ds.UndoOpts()), "kept")
             self.assertEqual(runner.calls, [])
-            args["name"] = "devstack-webstack"
+            args["name"] = "devstack-devbox"
             self.assertEqual(ds.UNDO["incus_acl"](ctx, args, ds.UndoOpts(whole=True)), "undone")
             self.assertEqual(runner.calls, [
-                ["incus", "config", "device", "unset", "webstack", "eth0", "security.acls"],
-                ["incus", "config", "device", "unset", "webstack", "eth0", "security.acls.default.ingress.action"],
-                ["incus", "network", "acl", "delete", "devstack-webstack"],
+                ["incus", "config", "device", "unset", "devbox", "eth0", "security.acls"],
+                ["incus", "config", "device", "unset", "devbox", "eth0", "security.acls.default.ingress.action"],
+                ["incus", "network", "acl", "delete", "devstack-devbox"],
             ])
 
     def test_ensure_git_repo(self):
@@ -1731,7 +1813,7 @@ def syft_doc(serial="urn:uuid:557c4fbb-f3c6-4da7-a390-386b5d67470b", timestamp="
             "timestamp": timestamp,
             "tools": {"components": [{"type": "application", "author": "anchore",
                                       "name": "syft", "version": "1.54.0"}]},
-            "component": {"bom-ref": "6a02b9ad31f4252f", "type": "file", "name": "webstack-container"},
+            "component": {"bom-ref": "6a02b9ad31f4252f", "type": "file", "name": "devbox-container"},
         },
         "components": [
             {"bom-ref": "pkg:deb/debian/zlib1g@1%3A1.3.dfsg%2Breally1.3.1-1?arch=amd64&distro=debian-13"
@@ -1827,7 +1909,7 @@ class SbomPinTests(unittest.TestCase):
 class SbomNormalizeTests(unittest.TestCase):
     def norm(self, doc=None, **kw):
         kw.setdefault("kind", "container")
-        kw.setdefault("stack", "webstack")
+        kw.setdefault("stack", "devbox")
         return ds.normalize_cdx(doc if doc is not None else syft_doc(), **kw)
 
     def test_two_runs_normalize_to_the_same_bytes(self):
@@ -1889,7 +1971,7 @@ class SbomNormalizeTests(unittest.TestCase):
         self.assertNotIn("timestamp", text)
         self.assertNotIn("package-id=", text)
         self.assertEqual(out["metadata"]["component"]["bom-ref"], "root")
-        self.assertEqual(out["metadata"]["component"]["name"], "webstack-container")
+        self.assertEqual(out["metadata"]["component"]["name"], "devbox-container")
         # the syft version stays: it is the honest explanation for a document-wide diff
         self.assertEqual(out["metadata"]["tools"]["components"][0]["version"], "1.54.0")
 
@@ -1973,11 +2055,11 @@ class SbomLeakTests(unittest.TestCase):
                 ds.assert_no_sbom_leaks(leak, [], names=["louis"])
 
     def test_container_paths_are_fine(self):
-        ds.assert_no_sbom_leaks('{"a": "/srv/webstack/pnpm-lock.yaml", "b": "/var/lib/dpkg/status"}',
+        ds.assert_no_sbom_leaks('{"a": "/srv/devbox/pnpm-lock.yaml", "b": "/var/lib/dpkg/status"}',
                                 [], names=["bob"])
 
     def test_the_real_normalized_document_passes(self):
-        ds.assert_no_sbom_leaks(ds.cdx_bytes(ds.normalize_cdx(syft_doc(), kind="app", stack="webstack")), [])
+        ds.assert_no_sbom_leaks(ds.cdx_bytes(ds.normalize_cdx(syft_doc(), kind="app", stack="devbox")), [])
 
     def test_empty_literal_does_not_match_everything(self):
         ds.assert_no_sbom_leaks('{"a": "b"}', ["", None], names=["", None])

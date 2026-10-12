@@ -37,8 +37,8 @@ host, keeps the whole container off your host and LAN. See "Security and trust"
 in `index.html`.
 
 One `devstack.toml` describes everything. `devstack up` applies six idempotent,
-undoable **phases**: `base`, `app`, `proxy`, `standards`, `isolation`,
-`postgres`. It is a stdlib-only Python (>= 3.11) CLI; no pip.
+undoable **phases**: `base`, `postgres`, `app`, `proxy`, `standards`,
+`isolation`. It is a stdlib-only Python (>= 3.11) CLI; no pip.
 
 ## Quick start
 
@@ -55,7 +55,7 @@ undoable **phases**: `base`, `app`, `proxy`, `standards`, `isolation`,
 ./devstack leaks scan           # secrets in git history and uncommitted files, before you push
 ```
 
-Then `./devstack browse` opens `https://app.example.com.webstack/` in a Chromium
+Then `./devstack browse` opens `https://app.example.com.devbox/` in a Chromium
 confined to the dev domain, with its own trust in the dev CA (needs
 `sudo apt install libnss3-tools`). Pages the container serves are untrusted: in
 your everyday browser their scripts could reach your host's loopback services

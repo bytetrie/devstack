@@ -371,7 +371,7 @@ DEFAULT_HEADERS = {
 
 SCHEMA: list[Field] = [
     # stack
-    Field("stack.name", "str", "webstack",
+    Field("stack.name", "str", "devbox",
           "Short name of this environment (lowercase, digits, '-'). Used to derive container, "
           "TLD, file and volume names. Must not clash with other containers, TLDs or files "
           "already on the host.",
@@ -413,7 +413,8 @@ SCHEMA: list[Field] = [
           check=_rel_paths),
     Field("project.scaffold", "bool", True,
           "Create the smoke-test app (server.ts, static/, error/, package.json, ...) in phase 'app'. "
-          "Existing files are kept."),
+          "Existing files are kept. The project's dependencies are installed either way when node_modules "
+          "is missing."),
     # container
     Field("container.name", "str", "{stack.name}", "incus instance name.",
           check=_match(r"[a-z][a-z0-9-]{0,62}", "a valid incus instance name")),
@@ -506,7 +507,7 @@ SCHEMA: list[Field] = [
     Field("dns.tld", "str", "{container.name}",
           "Dev TLD appended to site.hostname: app.example.com -> app.example.com.<tld>. "
           "Empty = use site.hostname itself (single-domain override).",
-          check=_match(r"([a-z0-9-]+(\.[a-z0-9-]+)*)?", "a domain suffix like 'webstack' (or empty)")),
+          check=_match(r"([a-z0-9-]+(\.[a-z0-9-]+)*)?", "a domain suffix like 'devbox' (or empty)")),
     Field("dns.allow_public_tld", "bool", False,
           "Allow dns.tld to be a real, delegated top-level domain (com, dev, app, ...). Off by default: "
           "the wildcard would then stop every site under that TLD from resolving on this host. "
@@ -1677,6 +1678,11 @@ class State:
 
     def status(self, pid: str) -> str:
         return self.data["phases"].get(pid, {}).get("status", "pending")
+
+    def changed_at(self, pid: str) -> float:
+        """When the phase's status last changed (for a done phase: when it finished), as a timestamp."""
+        ts = self.data["phases"].get(pid, {}).get("ts")
+        return dt.datetime.fromisoformat(ts).timestamp() if ts else 0.0
 
     def set_status(self, pid: str, status: str) -> None:
         if status == "pending":
@@ -3294,7 +3300,9 @@ class AppPhase(Phase):
     def describe(self, ctx: Ctx) -> list[str]:
         c = ctx.cfg
         if not c["project.scaffold"]:
-            return ["project.scaffold = false: nothing to create; verify that the entry file exists"]
+            return ["project.scaffold = false: nothing to create; `pnpm install --frozen-lockfile` if package.json "
+                    "exists and node_modules is missing",
+                    f"verify: {c['app.entry']} exists (the isolation phase starts it and checks /api/health)"]
         return [
             f"create (never overwrite) in {ctx.project}: " + ", ".join(rel for _, rel, _ in SCAFFOLD)
             + f" ({', '.join(sorted(SCAFFOLD_NEW_PROJECT_ONLY))} only along with a new package.json)",
@@ -3306,18 +3314,25 @@ class AppPhase(Phase):
 
     def apply(self, ctx: Ctx) -> None:
         c = ctx.cfg
-        if not c["project.scaffold"]:
-            return
-        tv = ctx.tvars()
-        new_project = not (ctx.project / "package.json").exists()
-        created = {rel: ctx.project_file(rel, render(tpl, tv), mode=mode) for tpl, rel, mode in SCAFFOLD
-                   if new_project or rel not in SCAFFOLD_NEW_PROJECT_ONLY}
+        pkg_json = ctx.project / "package.json"
+        new_pkg = False
+        if c["project.scaffold"]:
+            tv = ctx.tvars()
+            new_project = not pkg_json.exists()
+            created = {rel: ctx.project_file(rel, render(tpl, tv), mode=mode) for tpl, rel, mode in SCAFFOLD
+                       if new_project or rel not in SCAFFOLD_NEW_PROJECT_ONLY}
+            new_pkg = created["package.json"]
+        # Dependencies are installed whether or not devstack scaffolded the project: a rebuild removes
+        # the node_modules it created, and a project with scaffold = false still needs them to start.
         node_modules, lock = ctx.project / "node_modules", ctx.project / "pnpm-lock.yaml"
         had_nm, had_lock = node_modules.exists(), lock.exists()
-        if created["package.json"]:
+        if new_pkg:
             log.info("  pnpm: installing typescript, @types/node and the eslint toolchain")
             script = bash(PNPM_SETUP, PROJECT=ctx.cproject, PNPM=c["node.pnpm_version"],
                           DEV_PACKAGES=dev_packages(c))
+        elif not pkg_json.exists():
+            log.info("  no package.json: no dependencies to install")
+            return
         elif not had_nm:
             log.info("  pnpm: installing the project's dependencies (%s)",
                      "frozen to pnpm-lock.yaml" if had_lock else "no lockfile")
@@ -3342,6 +3357,11 @@ class AppPhase(Phase):
         expect(entry.exists(), f"{entry} does not exist")
         if ctx.state.status("isolation") == "done":
             return  # the systemd unit owns the port now; the isolation phase verifies it
+        if not c["project.scaffold"]:
+            # Your own app may need what only its systemd unit gets (secrets, $STATE_DIRECTORY): the
+            # isolation phase starts the unit and checks /api/health through Caddy.
+            log.info("  project.scaffold = false: %s is started and checked by the isolation phase", c["app.entry"])
+            return
         p = ctx.cexec(bash(APP_SMOKE, PROJECT=ctx.cproject, PORT=c["app.port"], ENTRY=c["app.entry"],
                            HOSTPORT=f"{url_host(c['app.bind'])}:{c['app.port']}"),
                       user=c["container.user"], check=False)
@@ -3762,6 +3782,36 @@ def sync_script_stale(ctx: Ctx) -> bool:
     """devstack-sync on an existing container differs from what isolation would install now (a new verb)."""
     return (ctx.state.status("isolation") == "done" and ctx.instance_running()
             and ctx.cread(SYNC_PATH) != devstack_sync_script(ctx.cfg))
+
+
+APT_LIST = "infra/apt-packages.txt"
+
+# Read as the container user: the project is container-writable, and root would follow a symlink in it
+# (the reason devstack-sync takes the list on stdin).
+APT_LIST_READ = r"""
+f=@@PROJECT@@/@@LIST@@
+if [ -f "$f" ]; then cat -- "$f"; else exit 44; fi
+"""
+
+
+def install_project_packages(ctx: Ctx) -> None:
+    """The project's apt packages (APT_LIST), installed by devstack-sync with the checks it applies to
+    `sudo devstack-sync packages`. Part of what a rebuild must reproduce: otherwise only a later
+    `scripts/sync-env.sh` brings them back. A failure warns instead of failing the phase: a bad line in a
+    project file shouldn't roll back the isolation phase."""
+    c = ctx.cfg
+    p = ctx.cexec(bash(APT_LIST_READ, PROJECT=ctx.cproject, LIST=APT_LIST), user=c["container.user"], check=False)
+    if p.returncode == 44:
+        log.info("  no %s: no project apt packages", APT_LIST)
+        return
+    if p.returncode != 0:
+        log.warning("could not read %s: %s", APT_LIST, p.stderr.strip())
+        return
+    log.info("  project apt packages (%s)", APT_LIST)
+    res = ctx.cexec(f"{SYNC_PATH} packages", input=p.stdout, stream=True, check=False)
+    if res.returncode != 0:
+        log.warning("installing the packages in %s failed (see above); fix the list, then run "
+                    "scripts/sync-env.sh in the container", APT_LIST)
 
 
 def refresh_sync(ctx: Ctx) -> bool:
@@ -4273,6 +4323,7 @@ class IsolationPhase(Phase):
             "ProtectSystem=strict, ...); copy in infra/; enable --now",
             f"runners: {runners}" if runners else "runners: none",
             f"/usr/local/sbin/devstack-sync; sudo for {c['container.user']}: {c['container.sudo']}",
+            f"`devstack-sync packages` < {APT_LIST} (the project's apt packages; a failure only warns)",
             f"verify: {c['app.port']} on loopback only, direct call without token -> 500, "
             f"https://{c.dev_host}/api/health -> 200, no Server header, egress profiles per user, "
             "Caddy admin off TCP, sudo, app data permissions",
@@ -4312,6 +4363,9 @@ class IsolationPhase(Phase):
         # A restart, not a reload: `caddy reload` would look for the new admin socket before it exists.
         apply_caddyfile(ctx, LEVEL_ISOLATION, restart=True)
 
+        ctx.cwrite(SYNC_PATH, devstack_sync_script(c), mode="0755")
+        install_project_packages(ctx)  # before the app first starts: it may need one of them
+
         unit_text = render("system/app.service", tv)
         unit = c["app.service_name"]
         ctx.cwrite(f"/etc/systemd/system/{unit}.service", unit_text)
@@ -4325,7 +4379,6 @@ class IsolationPhase(Phase):
         if c["app.runners"]:
             log.info("  runners: %s", ", ".join(f"{runner_unit(c, r)}.socket" for r in c["app.runners"]))
 
-        ctx.cwrite(SYNC_PATH, devstack_sync_script(c), mode="0755")
         apply_sudo(ctx)
         log.info("  sudo for %s: %s", c["container.user"], c["container.sudo"])
         ctx.state.set_fact("runners", c["app.runners"])
@@ -4364,6 +4417,8 @@ class IsolationPhase(Phase):
         p = host_curl(ctx, f"https://{c.dev_host}/api/health", "-f", "-D", "-")
         expect(p.returncode == 0, f"https://{c.dev_host}/api/health failed: {p.stderr.strip()}")
         expect('"ok":true' in p.stdout, f"unexpected /api/health response: {p.stdout[-300:]}")
+        if c["postgres.enabled"] and ctx.state.status("postgres") == "done":
+            expect('"db":true' in p.stdout, f"/api/health does not report db=true: {p.stdout[-300:]}")
         expect("\nserver:" not in p.stdout.lower(), "response still carries a Server header")
         log.info("  isolation OK")
 
@@ -4489,8 +4544,8 @@ class PostgresPhase(Phase):
             f"secret {c['secrets.dir']}/{c['postgres.env_file']} (DATABASE_URL, PG*); role {c['postgres.role']}, db {c['postgres.db']}"
             + (f", empty test db {c['postgres.test_db']}" if c["postgres.test_db"] else ""),
             f"~/.pgpass for {c['container.user']}: {c['postgres.write_pgpass']}; {dev_env_file(c)} (DATABASE_URL"
-            f"{', TEST_DATABASE_URL' if c['postgres.test_db'] else ''}); restart {c['app.service_name']}",
-            f"verify: pg_isready, login as {c['postgres.role']}, loopback only, /api/health db=true",
+            f"{', TEST_DATABASE_URL' if c['postgres.test_db'] else ''}); restart {c['app.service_name']} if the isolation phase is done",
+            f"verify: pg_isready, login as {c['postgres.role']}, loopback only, /api/health db=true (once isolation is done)",
         ]
 
     def apply(self, ctx: Ctx) -> None:
@@ -4586,7 +4641,10 @@ class PostgresPhase(Phase):
         log.info("  postgres OK (%s)", p.stdout.strip().splitlines()[-1] if p.stdout.strip() else "")
 
 
-PHASES: list[Phase] = [BasePhase(), AppPhase(), ProxyPhase(), StandardsPhase(), IsolationPhase(), PostgresPhase()]
+# postgres right after base: an app that needs its database (DATABASE_URL) can then start when isolation
+# starts its unit. Stacks built before this order have postgres applied last; active_phases() follows
+# the order phases were applied, so their undo stays correct.
+PHASES: list[Phase] = [BasePhase(), PostgresPhase(), AppPhase(), ProxyPhase(), StandardsPhase(), IsolationPhase()]
 PHASE_BY_ID = {p.id: p for p in PHASES}
 
 
@@ -4990,7 +5048,23 @@ def handle_missing_packages(ctx: Ctx, rep: Report) -> Report:
 
 
 def active_phases(ctx: Ctx) -> list[Phase]:
-    return [p for p in PHASES if ctx.state.status(p.id) in ("done", "failed", "running")]
+    """The phases that need undoing, in the order they were applied. Undo reverses that order: each
+    phase's snapshot predates everything applied after it. Usually PHASES order, but not on a stack built
+    before postgres moved up to run second (postgres was applied after isolation there), nor after a
+    phase was undone and applied again later. Ties (same second) keep PHASES order."""
+    active = [p for p in PHASES if ctx.state.status(p.id) in ("done", "failed", "running")]
+    return sorted(active, key=lambda p: ctx.state.changed_at(p.id))
+
+
+def applied_from(ctx: Ctx, pid: str, *, inclusive: bool = True) -> list[Phase]:
+    """Active phases applied at (inclusive) or after phase pid, in applied order: what undoing back to it
+    takes. A phase that isn't active has no place in that order; PHASES order stands in for it."""
+    active = active_phases(ctx)
+    ids = [p.id for p in active]
+    if pid in ids:
+        return active[ids.index(pid) + (0 if inclusive else 1):]
+    i = PHASES.index(PHASE_BY_ID[pid])
+    return [p for p in active if PHASES.index(p) >= i]
 
 
 def ensure_phase_snapshot(ctx: Ctx, pid: str) -> None:
@@ -5415,10 +5489,11 @@ def selected_phases(ctx: Ctx, args: argparse.Namespace) -> list[Phase]:
             raise DevstackError(f"--only {args.only}: earlier phases not done: {', '.join(missing)}")
         return [enabled[i]]
     target = ids.index(args.to) if getattr(args, "to", None) else len(ids) - 1
+    redo: set[str] = set()
     if getattr(args, "redo", None):
         target = max(target, max((i for i, p in enumerate(enabled) if ctx.state.status(p.id) == "done"), default=0))
-    return [p for p in enabled[: target + 1]
-            if ctx.state.status(p.id) != "done" or (getattr(args, "redo", None) and ids.index(p.id) >= ids.index(args.redo))]
+        redo = {args.redo} | {p.id for p in applied_from(ctx, args.redo)}  # what cmd_up undoes first
+    return [p for p in enabled[: target + 1] if ctx.state.status(p.id) != "done" or p.id in redo]
 
 
 def host_writes(ctx: Ctx, phases: list[Phase]) -> list[str]:
@@ -5543,7 +5618,7 @@ def cmd_up(ctx: Ctx, args: argparse.Namespace) -> int:
             ctx.r.run(["sudo", "-v"], tty=True)
 
         if args.redo:
-            redo = [p for p in active_phases(ctx) if PHASES.index(p) >= PHASES.index(PHASE_BY_ID[args.redo])]
+            redo = applied_from(ctx, args.redo)
             log.info("--redo %s: undoing %s first", args.redo, ", ".join(p.id for p in redo))
             undo_phases(ctx, redo, UndoOpts())
 
@@ -5806,7 +5881,7 @@ def cmd_undo(ctx: Ctx, args: argparse.Namespace) -> int:
         elif args.to:
             if args.to not in PHASE_BY_ID:
                 raise ConfigError(f"--to {args.to}: unknown phase")
-            targets = [p for p in active if PHASES.index(p) > PHASES.index(PHASE_BY_ID[args.to])]
+            targets = applied_from(ctx, args.to, inclusive=False)
         else:
             targets = active[-1:]
         def leftover(e: dict) -> bool:
@@ -6948,7 +7023,7 @@ def checkpoint_restore(ctx: Ctx, name: str) -> int:
     if meta is None:
         raise ConfigError(f"no checkpoint {name} (devstack checkpoint list)")
     phases = [p.id for p in active_phases(ctx)]
-    if phases != meta["phases"] or any(ctx.state.status(p) != "done" for p in phases):
+    if sorted(phases) != sorted(meta["phases"]) or any(ctx.state.status(p) != "done" for p in phases):
         raise DevstackError(f"checkpoint {name} was taken with phases {', '.join(meta['phases'])} done; now "
                             f"{', '.join(phases) or 'none'} (not all done, or different). Restoring it would leave "
                             "the container and devstack's journal disagreeing: bring the phases back first")
@@ -7008,7 +7083,7 @@ def cmd_checkpoint(ctx: Ctx, args: argparse.Namespace) -> int:
             print("no checkpoints")
         for m in metas:
             missing = checkpoint_missing(ctx, m)
-            stale = m["phases"] != [p.id for p in active_phases(ctx)]
+            stale = sorted(m["phases"]) != sorted(p.id for p in active_phases(ctx))
             note = f"incomplete: {', '.join(missing)} gone" if missing else ("phases changed since" if stale else "")
             print(f"  {describe_checkpoint(m)}" + (f"   ({note})" if note else ""))
         used = sum(m.get("bytes") or 0 for m in metas)

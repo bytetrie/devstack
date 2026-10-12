@@ -171,18 +171,18 @@ footer { margin-top: 4rem; padding-top: 1rem; border-top: 1px solid var(--line);
     <div class="box">
       <h4>Host</h4>
       <ul>
-        <li>Browser → <code>https://app.example.com.webstack</code></li>
-        <li>VSCode Remote-SSH → <code>webstack</code></li>
-        <li>dnsmasq: <code>address=/webstack/&lt;ip&gt;</code></li>
+        <li>Browser → <code>https://app.example.com.devbox</code></li>
+        <li>VSCode Remote-SSH → <code>devbox</code></li>
+        <li>dnsmasq: <code>address=/devbox/&lt;ip&gt;</code></li>
         <li>devstack's root CA (key stays here, limited to the dev domain) in the trust store</li>
-        <li><code>~/code/webstack</code> (your files)</li>
+        <li><code>~/code/devbox</code> (your files)</li>
       </ul>
     </div>
     <div class="box data">
       <h4>Kept outside the container</h4>
       <ul>
-        <li>incus volumes <code>webstack-pgdata</code>, <code>webstack-appdata</code></li>
-        <li>incus network ACL <code>devstack-webstack</code>: container ↛ host, LAN</li>
+        <li>incus volumes <code>devbox-pgdata</code>, <code>devbox-appdata</code></li>
+        <li>incus network ACL <code>devstack-devbox</code>: container ↛ host, LAN</li>
         <li>db dumps and app data archives in <code>~/.local/share/devstack/…</code></li>
         <li>journal + state in <code>~/.local/state/devstack/…</code></li>
       </ul>
@@ -190,26 +190,26 @@ footer { margin-top: 4rem; padding-top: 1rem; border-top: 1px solid var(--line);
   </div>
   <div class="arrow">incusbr0 bridge · pinned IPv4</div>
   <div class="box container">
-    <h4>Container webstack (debian/13)</h4>
+    <h4>Container devbox (debian/13)</h4>
     <ul>
       <li>sshd, key-only, one user with your uid; its only root command is <code>sudo devstack-sync</code></li>
       <li>ufw: in 22, 80, 443 only · nftables: per-service egress profiles</li>
-      <li>Caddy :443 → static files from <code>/srv/webstack/static</code>, <code>/api/*</code> → 127.0.0.1:8080 with an internal token; admin API on a root/caddy-only socket</li>
-      <li><code>webstack-app.service</code>: Node as <code>webstack-app</code>, read-only except <code>/var/lib/webstack-app</code> (volume), egress: loopback only</li>
-      <li>runners (optional): one job per connection as <code>webstack-runner</code>, egress: public internet only</li>
+      <li>Caddy :443 → static files from <code>/srv/devbox/static</code>, <code>/api/*</code> → 127.0.0.1:8080 with an internal token; admin API on a root/caddy-only socket</li>
+      <li><code>devbox-app.service</code>: Node as <code>devbox-app</code>, read-only except <code>/var/lib/devbox-app</code> (volume), egress: loopback only</li>
+      <li>runners (optional): one job per connection as <code>devbox-runner</code>, egress: public internet only</li>
       <li>Postgres 18 on 127.0.0.1:5432, data on the volume at <code>/var/lib/postgresql</code></li>
-      <li><code>/srv/webstack</code> = your project folder (idmapped mount)</li>
+      <li><code>/srv/devbox</code> = your project folder (idmapped mount)</li>
     </ul>
   </div>
 </div>
-<p>Names above are the defaults for <code>stack.name = "webstack"</code>. Change that one key and every name follows.</p>
+<p>Names above are the defaults for <code>stack.name = "devbox"</code>. Change that one key and every name follows.</p>
 
 <h3>Why it's built in layers</h3>
 <p>Each phase adds one concern on top of the last, so you can stop after any of them and see what that layer gives you:</p>
 <dl class="kv">
   <dt>contain</dt><dd>Dev work (npm packages, build tools, the app) runs in a container, so user-level but possibly untrusted code can't reach your host's files or processes. Your editor stays on the host and connects in over ssh.</dd>
   <dt>serve</dt><dd>A tiny zero-dependency server proves the container can run an app that reads files and answers requests. It's a smoke test, not your app.</dd>
-  <dt>proxy</dt><dd>Caddy sits in front of the app. You browse to the real intended domain plus a dev suffix (<code>app.example.com.webstack</code> for a future <code>app.example.com</code>), over HTTPS, with no port numbers. Caddy serves static files itself and forwards <code>/api/*</code> to the app.</dd>
+  <dt>proxy</dt><dd>Caddy sits in front of the app. You browse to the real intended domain plus a dev suffix (<code>app.example.com.devbox</code> for a future <code>app.example.com</code>), over HTTPS, with no port numbers. Caddy serves static files itself and forwards <code>/api/*</code> to the app.</dd>
   <dt>standards</dt><dd>Client-side safety and speed: precompressed files, response compression, and security headers including a Content Security Policy.</dd>
   <dt>isolation</dt><dd>Server-side safety: the app listens on 127.0.0.1 only (never 0.0.0.0, the top rule), a firewall backs that up, the app only answers requests carrying a secret token that Caddy adds, and it runs as a tightly restricted systemd service under its own user, whose outbound traffic the kernel limits (loopback only by default). Tools that need the internet run as separate, short-lived runners. You (and every agent) get no general root, so nothing you can edit runs as root.</dd>
   <dt>data</dt><dd>Postgres, local-only with password auth, with its data kept outside the container so it survives rebuilds.</dd>
@@ -240,8 +240,8 @@ footer { margin-top: 4rem; padding-top: 1rem; border-top: 1px solid var(--line);
 <section id="dns">
 <h2>Host DNS</h2>
 <p>devstack assumes the host <strong>already resolves through dnsmasq</strong>, set up once by hand (see below, including any VPN workaround). It never touches <code>/etc/resolv.conf</code>, NetworkManager or <code>/etc/hosts</code>. For each stack it writes exactly one file and restarts dnsmasq:</p>
-<pre><code><span class="c"># /etc/dnsmasq.d/devstack-webstack.conf</span>
-address=/webstack/10.60.225.x       <span class="c"># the TLD and every name under it</span>
+<pre><code><span class="c"># /etc/dnsmasq.d/devstack-devbox.conf</span>
+address=/devbox/10.60.225.x       <span class="c"># the TLD and every name under it</span>
 host-record=api.other.test,10.60.225.x   <span class="c"># one per dns.extra_names</span></code></pre>
 <p>Adding a stack adds one file, and removing a stack removes it. With <code>dns.tld = ""</code> you get the single-domain case: <code>site.hostname</code> itself points at the container, useful for overriding a real domain locally. devstack warns about it, because that name then stops resolving to the real site for the whole machine.</p>
 <p><code>dns.tld</code> must not be a real top-level domain (<code>com</code>, <code>dev</code>, <code>app</code>, ...): <code>address=/dev/&lt;ip&gt;</code> would send every <code>.dev</code> site to the container. devstack checks the value against a bundled IANA list and refuses; <code>dns.allow_public_tld = true</code> overrides that. Good choices are the default (your stack name), <code>internal</code> (reserved for private use) or any unused name. Since a stack name becomes the default TLD, a stack called <code>app</code> or <code>dev</code> is refused too unless you set another <code>dns.tld</code>.</p>
@@ -271,10 +271,10 @@ host-record=api.other.test,10.60.225.x   <span class="c"># one per dns.extra_nam
 ./devstack preflight            <span class="c"># checks only, changes nothing</span>
 ./devstack plan                 <span class="c"># every step with the real names and paths</span>
 ./devstack up --to base         <span class="c"># container, user, ssh, Node</span>
-ssh webstack                    <span class="c"># look around</span>
+ssh devbox                    <span class="c"># look around</span>
 ./devstack up                   <span class="c"># the remaining phases</span>
 ./devstack status</code></pre>
-<p>Then run <code>./devstack browse</code>: it opens <code>https://app.example.com.webstack/</code> in a Chromium that can reach only the dev domain (see <a href="#dev-browser">The dev browser</a>). In VSCode, choose Remote-SSH → <code>webstack</code> → open <code>/srv/webstack</code>.</p>
+<p>Then run <code>./devstack browse</code>: it opens <code>https://app.example.com.devbox/</code> in a Chromium that can reach only the dev domain (see <a href="#dev-browser">The dev browser</a>). In VSCode, choose Remote-SSH → <code>devbox</code> → open <code>/srv/devbox</code>.</p>
 
 <h3>Interactive and non-interactive</h3>
 <p>devstack runs interactively when you start it from a terminal. Pass <code>-n</code> (or pipe its input) for non-interactive mode, which never asks anything and fails instead of guessing:</p>
@@ -336,11 +336,11 @@ ssh webstack                    <span class="c"># look around</span>
   <thead><tr><th>#</th><th>Phase</th><th>Does</th><th>Verifies</th></tr></thead>
   <tbody>
     <tr><td class="num">1</td><td><code>base</code></td><td>Creates the container and the shared project folder (running <code>git init</code> on the host if it isn't a repository yet), with all of <code>.git</code> read-only inside (optionally extra mounts and the GPU; mounts added to the config later are added by the next <code>up</code>, see <a href="#daily">Day to day</a>), and pins the IP. Attaches the network ACL that keeps the container off your host and LAN. Adds the login user <code>dev</code> with <em>your</em> uid (so shared files line up), no general sudo, and key-only sshd. Sets up the ssh key, a pinned host key and the <code>Host</code> block. Installs Node with gpg and sha256 checks, plus pnpm via corepack, and syft (sha256 checked) for the dependency inventory.</td><td>ssh login, Node version, file ownership, <code>.git</code> mounted read-only, host services unreachable</td></tr>
-    <tr><td class="num">2</td><td><code>app</code></td><td>Scaffolds a zero-dependency <code>server.ts</code>, <code>static/</code>, <code>error/</code>, <code>package.json</code>, <code>tsconfig.json</code>, <code>infra/apt-packages.txt</code>, <code>scripts/sync-env.sh</code>, a <code>README.md</code> that carries the project's dependency policy, and an <code>AGENTS.md</code> recording what the container enforces, for coding agents working in the project. A new project also gets the checks: a strict type-aware ESLint setup (<code>eslint.config.js</code>, with security and HTML-injection rules), <code>pnpm check</code> and <code>pnpm lint:changed</code>, and a <code>pnpm-workspace.yaml</code> that keeps out packages less than 7 days old, weakened publishing trust and install scripts. devstack writes no CI files; the project README gives the command to make blocking in whichever CI you use. Existing files are never overwritten, and an existing project gets none of these. Then installs TypeScript and the lint tools with pnpm.</td><td><code>/api/health</code> answers inside the container</td></tr>
-    <tr><td class="num">3</td><td><code>proxy</code></td><td>Installs Caddy (apt signing key checked against a pinned fingerprint) with <code>local_certs</code> and generates <code>infra/Caddyfile</code>, whose site blocks import devstack's same-origin rule (see <a href="#same-origin">Requests from other sites</a>). Creates a local CA on the host: the root key stays there and is limited to the dev domain, and only a signed intermediate goes into the container for Caddy. Installs the root on the host and in Chromium, and adds the dnsmasq drop-in.</td><td><code>https://&lt;dev host&gt;/</code> from the host, catch-all error page, a cross-site request refused</td></tr>
-    <tr><td class="num">4</td><td><code>standards</code></td><td>Precompresses static files to <code>.br</code>/<code>.gz</code> and turns on <code>encode</code> and security headers. The error page's inline style hash is added to the CSP automatically.</td><td>CSP present, brotli served</td></tr>
-    <tr><td class="num">5</td><td><code>isolation</code></td><td>Enables ufw, creates the service users and the internal token for Caddy → app, and loads the nftables egress profiles. Moves Caddy's admin API to a unix socket; Caddy now strips <code>Server</code>/<code>Via</code>. The app runs as a hardened systemd unit with its data volume; runners get their socket units. Installs <code>devstack-sync</code> and limits your sudo to it.</td><td>Loopback-only port, no token → 500, through Caddy → 200, <code>systemd-analyze security</code> score, each service user's egress, no admin port, sudo, data permissions</td></tr>
-    <tr><td class="num">6</td><td><code>postgres</code></td><td>Puts the data volume at <code>/var/lib/postgresql</code> and installs Postgres from apt.postgresql.org. Sets localhost-only, scram auth, the app role, db and an empty test db, the credentials file, <code>~/.pgpass</code> and <code>~/.config/devstack/webstack.env</code> (<code>DATABASE_URL</code>, <code>TEST_DATABASE_URL</code>).</td><td>Role login, loopback only, <code>/api/health</code> → <code>"db": true</code></td></tr>
+    <tr><td class="num">2</td><td><code>postgres</code></td><td>Puts the data volume at <code>/var/lib/postgresql</code> and installs Postgres from apt.postgresql.org. Sets localhost-only, scram auth, the app role, db and an empty test db, the credentials file, <code>~/.pgpass</code> and <code>~/.config/devstack/devbox.env</code> (<code>DATABASE_URL</code>, <code>TEST_DATABASE_URL</code>). It runs second, so an app that needs its database can start once <code>isolation</code> starts its unit.</td><td>Role login, loopback only (<code>isolation</code> then checks <code>/api/health</code> → <code>"db": true</code>)</td></tr>
+    <tr><td class="num">3</td><td><code>app</code></td><td>Scaffolds a zero-dependency <code>server.ts</code>, <code>static/</code>, <code>error/</code>, <code>package.json</code>, <code>tsconfig.json</code>, <code>infra/apt-packages.txt</code>, <code>scripts/sync-env.sh</code>, a <code>README.md</code> that carries the project's dependency policy, and an <code>AGENTS.md</code> recording what the container enforces, for coding agents working in the project. A new project also gets the checks: a strict type-aware ESLint setup (<code>eslint.config.js</code>, with security and HTML-injection rules), <code>pnpm check</code> and <code>pnpm lint:changed</code>, and a <code>pnpm-workspace.yaml</code> that keeps out packages less than 7 days old, weakened publishing trust and install scripts. devstack writes no CI files; the project README gives the command to make blocking in whichever CI you use. Existing files are never overwritten, and an existing project gets none of these. Then installs TypeScript and the lint tools with pnpm. With <code>project.scaffold = false</code> nothing is created; either way, a project without <code>node_modules</code> (a clone, or a rebuild) gets <code>pnpm install --frozen-lockfile</code>.</td><td><code>/api/health</code> answers inside the container (the scaffolded app; your own app is started and checked by <code>isolation</code>)</td></tr>
+    <tr><td class="num">4</td><td><code>proxy</code></td><td>Installs Caddy (apt signing key checked against a pinned fingerprint) with <code>local_certs</code> and generates <code>infra/Caddyfile</code>, whose site blocks import devstack's same-origin rule (see <a href="#same-origin">Requests from other sites</a>). Creates a local CA on the host: the root key stays there and is limited to the dev domain, and only a signed intermediate goes into the container for Caddy. Installs the root on the host and in Chromium, and adds the dnsmasq drop-in.</td><td><code>https://&lt;dev host&gt;/</code> from the host, catch-all error page, a cross-site request refused</td></tr>
+    <tr><td class="num">5</td><td><code>standards</code></td><td>Precompresses static files to <code>.br</code>/<code>.gz</code> and turns on <code>encode</code> and security headers. The error page's inline style hash is added to the CSP automatically.</td><td>CSP present, brotli served</td></tr>
+    <tr><td class="num">6</td><td><code>isolation</code></td><td>Enables ufw, creates the service users and the internal token for Caddy → app, and loads the nftables egress profiles. Moves Caddy's admin API to a unix socket; Caddy now strips <code>Server</code>/<code>Via</code>. The app runs as a hardened systemd unit with its data volume; runners get their socket units. Installs <code>devstack-sync</code>, installs the packages in <code>infra/apt-packages.txt</code> through it (a rebuild gets them back), and limits your sudo to it.</td><td>Loopback-only port, no token → 500, through Caddy → 200, <code>systemd-analyze security</code> score, each service user's egress, no admin port, sudo, data permissions, <code>"db": true</code> with Postgres</td></tr>
   </tbody>
 </table></div>
 <pre><code>./devstack up --to proxy        <span class="c"># stop after a phase</span>
@@ -385,7 +385,7 @@ ssh webstack                    <span class="c"># look around</span>
 <pre><code>./devstack snapshot list            <span class="c"># shows which phase each snapshot can undo</span>
 ./devstack snapshot prune           <span class="c"># delete phase snapshots of finished phases</span>
 ./devstack snapshot create before-x <span class="c"># a bare container snapshot, outside devstack's bookkeeping</span>
-incus snapshot restore webstack before-x</code></pre>
+incus snapshot restore devbox before-x</code></pre>
 <ul>
   <li><code>snapshots.cleanup = "manual"</code> (default) keeps them until you prune. <code>"auto"</code> prunes after <code>up</code> finishes with everything verified.</li>
   <li>After pruning, those phases can only be undone with <code>destroy</code>. Your data volume is still kept.</li>
@@ -431,9 +431,9 @@ incus snapshot restore webstack before-x</code></pre>
 <pre><code>./devstack db backup               <span class="c"># pg_dump -Fc into postgres.backup_dir</span>
 ./devstack db restore FILE.dump    <span class="c"># takes a safety backup first; runs as the app role, not superuser</span>
 ./devstack db shell                <span class="c"># psql as the app role</span></code></pre>
-<p>The app gets <code>DATABASE_URL</code> and <code>PG*</code> variables from <code>/etc/app-secrets/postgres.env</code> (root-only, passed in by systemd). Inside the container, plain <code>psql -h 127.0.0.1 -U webstack_app webstack</code> works thanks to <code>~/.pgpass</code>, and dev tools read <code>~/.config/devstack/webstack.env</code>. Integration tests use <code>TEST_DATABASE_URL</code> (<code>webstack_test</code>, empty, not backed up); make them refuse to run unless the database name ends in <code>_test</code>.</p>
+<p>The app gets <code>DATABASE_URL</code> and <code>PG*</code> variables from <code>/etc/app-secrets/postgres.env</code> (root-only, passed in by systemd). Inside the container, plain <code>psql -h 127.0.0.1 -U devbox_app devbox</code> works thanks to <code>~/.pgpass</code>, and dev tools read <code>~/.config/devstack/devbox.env</code>. Integration tests use <code>TEST_DATABASE_URL</code> (<code>devbox_test</code>, empty, not backed up); make them refuse to run unless the database name ends in <code>_test</code>.</p>
 <h3>App data</h3>
-<p>The app's only writable folder is <code>/var/lib/webstack-app</code> (<code>$STATE_DIRECTORY</code> in the app). By default it's the incus volume <code>webstack-appdata</code>, kept like the Postgres volume (<code>app.data = "host"</code> uses a host folder instead, <code>"none"</code> turns it off). You can read it from your shell but not write it: writes go through the app, which keeps its own rules (for example rows ↔ files).</p>
+<p>The app's only writable folder is <code>/var/lib/devbox-app</code> (<code>$STATE_DIRECTORY</code> in the app). By default it's the incus volume <code>devbox-appdata</code>, kept like the Postgres volume (<code>app.data = "host"</code> uses a host folder instead, <code>"none"</code> turns it off). You can read it from your shell but not write it: writes go through the app, which keeps its own rules (for example rows ↔ files).</p>
 <pre><code>./devstack data backup             <span class="c"># tar.gz into app.data_backup_dir (also automatic before destroy)</span>
 ./devstack data restore FILE       <span class="c"># stops the app, takes a safety backup, replaces the data</span></code></pre>
 </section>
@@ -454,7 +454,7 @@ incus snapshot restore webstack before-x</code></pre>
 <div class="table-wrap"><table>
   <thead><tr><th>You changed</th><th>Then (inside the container)</th></tr></thead>
   <tbody>
-    <tr><td><code>server.ts</code></td><td><code>sudo devstack-sync restart app</code> · logs: <code>journalctl -u webstack-app -f</code> (no sudo needed)</td></tr>
+    <tr><td><code>server.ts</code></td><td><code>sudo devstack-sync restart app</code> · logs: <code>journalctl -u devbox-app -f</code> (no sudo needed)</td></tr>
     <tr><td>security updates are available</td><td>On the host: <code>./devstack upgrade</code> (or <code>destroy</code> then <code>up</code> for a fresh base image). Not <code>apt-get</code> by hand.</td></tr>
     <tr><td>a system package is needed</td><td>Add it to <code>infra/apt-packages.txt</code>, run <code>scripts/sync-env.sh</code>, then <code>./devstack sbom generate</code> on the host and commit all three. Never <code>apt-get</code> by hand.</td></tr>
     <tr><td>a runner's script</td><td><code>sudo devstack-sync restart runners</code> (each connection starts a fresh job anyway)</td></tr>
@@ -464,7 +464,7 @@ incus snapshot restore webstack before-x</code></pre>
     <tr><td>another site must reach the app (an OAuth or payment redirect back)</td><td>On the host: <code>caddy.same_origin = "allow-navigation"</code> in <code>devstack.toml</code>, then <code>./devstack up</code>. It rewrites and reloads the Caddy files without a phase rerun. See <a href="#same-origin">Requests from other sites</a>.</td></tr>
     <tr><td>a dev server (Vite, Storybook) to look at</td><td>On the host: add it to <code>caddy.dev_servers</code> in <code>devstack.toml</code> (<code>vite = "5173"</code>), run <code>./devstack up</code>, then <code>./devstack browse vite</code>. It is served at <code>https://vite.&lt;dev host&gt;/</code>.</td></tr>
     <tr><td>about to let an agent loose, or try something risky</td><td>On the host: <code>./devstack checkpoint create</code>; if it goes wrong, <code>./devstack checkpoint restore &lt;name&gt;</code> (see <a href="#checkpoints">Checkpoints</a>)</td></tr>
-    <tr><td>anything that needs root</td><td>From the host: <code>incus exec webstack -- bash</code>. For lasting changes, change <code>devstack.toml</code> and run <code>up</code>.</td></tr>
+    <tr><td>anything that needs root</td><td>From the host: <code>incus exec devbox -- bash</code>. For lasting changes, change <code>devstack.toml</code> and run <code>up</code>.</td></tr>
   </tbody>
 </table></div>
 <h3>Add a host folder later</h3>
@@ -483,13 +483,13 @@ readonly = false               <span class="c"># default; true makes it read-onl
 <h3>Add a runner</h3>
 <p>For tools that fetch from the internet or parse untrusted files (yt-dlp, ffmpeg, page fetchers), add a runner to <code>devstack.toml</code> and run <code>./devstack up --redo isolation</code>. A project can ask for one in its <code>infra/devstack-requires.toml</code>; either way you approve it with <code>yes</code>, because it is project code running as a service with internet access.</p>
 <pre><code>[[app.runners]]
-name = "fetch"                       <span class="c"># → webstack-fetch.socket + webstack-fetch@.service</span>
+name = "fetch"                       <span class="c"># → devbox-fetch.socket + devbox-fetch@.service</span>
 command = "node scripts/runner.ts"   <span class="c"># project-relative, plain words only</span>
 port = 9101                          <span class="c"># 127.0.0.1 only</span>
 memory_max = "2G"                    <span class="c"># default 1G</span>
 runtime_max = "2h"                   <span class="c"># default 1h</span>
 max_connections = 2                  <span class="c"># default 4</span></code></pre>
-<p>Each connection starts one job as <code>webstack-runner</code>, with the connection as its stdin and stdout; closing it ends the job. A job reaches the public internet but not loopback, your host or the LAN, gets no secrets, can't read the app data, and can only write <code>/var/lib/webstack-app/incoming/</code>. The protocol and what the app does with <code>incoming/</code> are up to the project: treat it as untrusted input.</p>
+<p>Each connection starts one job as <code>devbox-runner</code>, with the connection as its stdin and stdout; closing it ends the job. A job reaches the public internet but not loopback, your host or the LAN, gets no secrets, can't read the app data, and can only write <code>/var/lib/devbox-app/incoming/</code>. The protocol and what the app does with <code>incoming/</code> are up to the project: treat it as untrusted input.</p>
 </section>
 
 <section id="sbom">
@@ -547,7 +547,7 @@ max_connections = 2                  <span class="c"># default 4</span></code></
     <tr><td>Services</td><td>the app, runner jobs</td><td>A fixed system user each, an nftables egress profile matched on that user, and systemd hardening.</td></tr>
   </tbody>
 </table></div>
-<p>You and your agents are the same Linux user (<code>dev</code>, carrying your uid so files in the shared folder come out owned by you on the host), so the container can't tell you apart. The rule is therefore about <em>what</em> runs as root, not who asks: code that runs as root is never code your user can edit, and security-relevant changes come from the host, through <code>devstack up</code>. When you need root, use <code>incus exec webstack -- bash</code> on the host.</p>
+<p>You and your agents are the same Linux user (<code>dev</code>, carrying your uid so files in the shared folder come out owned by you on the host), so the container can't tell you apart. The rule is therefore about <em>what</em> runs as root, not who asks: code that runs as root is never code your user can edit, and security-relevant changes come from the host, through <code>devstack up</code>. When you need root, use <code>incus exec devbox -- bash</code> on the host.</p>
 <h3>What you and your agents can and can't do</h3>
 <ul>
   <li><strong>Can:</strong> edit and run any project code, use the internet, use the database as the app role, read service logs and the app data, run <code>sudo devstack-sync</code> (install packages listed in <code>infra/apt-packages.txt</code>, restart the app or runners, reload Caddy, status), and change a project-owned Caddyfile.</li>
@@ -590,7 +590,7 @@ max_connections = 2                  <span class="c"># default 4</span></code></
   <dt>both</dt><dd>Default. Progress in the terminal, full detail in <code>logging.file</code></dd>
   <dt>file</dt><dd>Terminal shows only warnings and errors</dd>
   <dt>stderr</dt><dd>Terminal only</dd>
-  <dt>journald</dt><dd>Read with <code>journalctl -t devstack-webstack</code></dd>
+  <dt>journald</dt><dd>Read with <code>journalctl -t devstack-devbox</code></dd>
 </dl>
 <p>Override per run with <code>--log-target</code>, <code>--log-file</code> and <code>--log-level</code>. The file always gets every command, its exit code and its output. Secrets are passed through stdin or files, never on the command line, and any that slip into output are replaced with <code>***</code>.</p>
 </section>
@@ -613,7 +613,7 @@ max_connections = 2                  <span class="c"># default 4</span></code></
 <h2>Design choices</h2>
 <ul>
   <li>The project is mounted at <code>/srv/&lt;name&gt;</code>, not under <code>/home</code>. Debian 12+ home folders are private, so Caddy and the hardened service couldn't read them there. It also lets the unit use <code>ProtectHome=yes</code>, which would otherwise have to be turned off.</li>
-  <li>The server binds to 127.0.0.1 from phase 2 on, so it's never reachable at <code>http://&lt;container-ip&gt;:8080</code>. Phase 2 checks it from inside the container, and the browser reaches it through Caddy from phase 3.</li>
+  <li>The server binds to 127.0.0.1 from the start, so it's never reachable at <code>http://&lt;container-ip&gt;:8080</code>. The <code>app</code> phase checks it from inside the container, and the browser reaches it through Caddy from <code>proxy</code> on.</li>
   <li>The container's ssh host key is read through <code>incus exec</code> and pinned, so there's no fingerprint to compare by hand on first connect.</li>
   <li>Postgres's repo is added the documented manual way. Its data sits on a separate volume with a fixed postgres uid.</li>
   <li>The default image is debian/13, the current stable release, whatever the host runs. Containers share the host kernel either way. GPU passthrough is available behind <code>gpu.enabled</code>.</li>
