@@ -8,7 +8,6 @@ import argparse
 import importlib.util
 import json
 import os
-import pwd
 import re
 import shutil
 import subprocess
@@ -2180,14 +2179,20 @@ class ContainerIdentityTests(unittest.TestCase):
     def test_no_committed_scaffold_file_names_the_host_user(self):
         """Regression: with a host-derived default, the scaffolded README.md -- which the project
         commits -- rendered the host login name into git. Every service account is stack-derived,
-        so nothing devstack writes into the project should depend on who is logged in."""
-        with tempfile.TemporaryDirectory() as d:
+        so nothing devstack writes into the project should depend on who is logged in.
+        The host identity is a sentinel: a real login can be an ordinary word (GitHub Actions
+        runs as `runner`, which the README uses for app runners)."""
+        host_login = "hostlogin-q7zx"
+        fake_env = {"env.user": host_login, "env.uid": str(os.getuid()),
+                    "env.home": f"/home/{host_login}"}
+        with unittest.mock.patch.object(ds, "computed_values", return_value=fake_env), \
+                tempfile.TemporaryDirectory() as d:
             tv = make_ctx(Path(d)).tvars()
-        host_login = pwd.getpwuid(os.getuid()).pw_name
+            rendered = {rel: ds.render(tpl, tv) for tpl, rel, _mode in ds.SCAFFOLD}
         self.assertNotEqual(tv["USER"], host_login,
                             "the default container user still resolves to the host login name")
-        for tpl, rel, _mode in ds.SCAFFOLD:
-            self.assertNotIn(host_login, ds.render(tpl, tv), f"{rel} names the host user")
+        for rel, text in rendered.items():
+            self.assertNotIn(host_login, text, f"{rel} names the host user")
 
     def test_the_name_is_still_overridable(self):
         cfg = make_config(**{"container.user": "louis"})
