@@ -1,0 +1,15 @@
+# System packages this project needs in its container, beyond what devstack
+# installs. One Debian package name per line; '#' starts a comment.
+#
+# To add one: add a line here and run scripts/sync-env.sh, which installs it and
+# lets `devstack sbom generate` pick it up. Commit this file together with the
+# regenerated infra/sbom/container.cdx.json. Never `apt-get install` by hand: the dev user
+# has no root, and a package installed by hand is gone on the next rebuild.
+#
+# Installed by root through `sudo devstack-sync packages`, from the apt sources
+# devstack configured (Debian, plus the Caddy and PostgreSQL repos) only. Names
+# only: no versions (`pkg=1.0`), releases (`pkg/trixie`), options or .deb files.
+# Services that a package ships are masked; a service the app depends on is a
+# devstack change on the host, not a line here.
+
+git       # Required for running lint

@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="generator" content="devstack-smoke" />
+    <title>@@STACK@@</title>
+    <link rel="stylesheet" href="/style.css" />
+    <script type="module" src="/main.js"></script>
+  </head>
+  <body>
+    <main>
+      <h1>@@STACK@@ is up</h1>
+      <p>Served by Caddy from <code>static/</code> at <code>https://@@DEV_HOST@@</code>.</p>
+      <h2>API health</h2>
+      <pre id="health">checking /api/health …</pre>
+      <p class="hint">
+        The API answers once the app service runs (phase “isolation”). The
+        <code>db</code> field turns <code>true</code> after phase “postgres”.
+      </p>
+    </main>
+  </body>
+</html>

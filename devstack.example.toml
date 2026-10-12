@@ -1,0 +1,654 @@
+# devstack configuration. Every key is optional; missing keys use the default shown.
+# {section.key} placeholders refer to other keys; {env.user}, {env.uid}, {env.home} and
+# {stack.name_sql} (stack.name with '-' -> '_') are computed. `./devstack config explain`
+# prints these docs, `./devstack config show` the resolved values.
+
+# Identity of this environment. Every name below derives from stack.name by default, so
+# a second stack only needs a different name.
+[stack]
+# Short name of this environment (lowercase, digits, '-'). Used to derive container,
+# TLD, file and volume names. Must not clash with other containers, TLDs or files
+# already on the host.
+# default: "webstack"
+name = "webstack"
+
+# Host-side state and dependency policy.
+[host]
+# Journal, state, backups of replaced files, CA copy, lock file. Deleting it makes
+# devstack forget what it owns, so undo would no longer work.
+# default: "~/.local/state/devstack/{stack.name}"
+state_dir = "~/.local/state/devstack/{stack.name}"
+
+# Non-interactive mode only: apt-install missing host tools instead of failing.
+# (Interactive mode asks.) Host packages are never removed by undo.
+# default: false
+install_missing = false
+
+# Behaviour when something goes wrong.
+[run]
+# What to do when a step or verification fails in non-interactive mode. 'rollback'
+# undoes the failed phase (earlier phases stay); 'stop' leaves it for debugging (clean
+# up later with `devstack undo`). Interactive mode asks.
+# choices: rollback, stop
+# default: "rollback"
+on_failure = "rollback"
+
+# Where log output goes. The log file always receives full debug output (every command
+# and its output, secrets redacted).
+[logging]
+# Where logs go: 'stderr', 'file', 'both', or 'journald' (journalctl -t
+# devstack-<name>). With 'file' or 'journald' the terminal still shows warnings and
+# errors.
+# choices: stderr, file, both, journald
+# default: "both"
+target = "both"
+
+# Log file (appended). Always gets debug detail.
+# default: "{host.state_dir}/devstack.log"
+file = "{host.state_dir}/devstack.log"
+
+# Terminal log level.
+# choices: debug, info, warning, error
+# default: "info"
+level = "info"
+
+# The project folder, shared between host (you edit it) and container (it runs there).
+[project]
+# Project folder on the host. Created if missing; existing files are never overwritten.
+# default: "~/code/{stack.name}"
+host_path = "~/code/{stack.name}"
+
+# Where the project folder is mounted inside the container (idmapped, so files keep your
+# uid). Kept outside /home so Caddy and the hardened service can read it.
+# default: "/srv/{stack.name}"
+container_path = "/srv/{stack.name}"
+
+# Extra files and folders inside the project to mount read-only in the container, so
+# code running there cannot edit what the host later runs, e.g. '.vscode' if you open
+# the project on the host. The whole .git is always read-only (the host runs git on it)
+# and needs no entry here. Relative to project.host_path. A path that doesn't exist yet
+# is mounted by the next `up` once it does.
+# default: []
+readonly_paths = []
+
+# Create the smoke-test app (server.ts, static/, error/, package.json, ...) in phase
+# 'app'. Existing files are kept.
+# default: true
+scaffold = true
+
+# The incus container that holds the whole stack.
+[container]
+# incus instance name.
+# default: "{stack.name}"
+name = "{stack.name}"
+
+# Image to launch. Debian 13 (trixie) by default: current stable. The container shares
+# the host kernel (and GPU driver, if passed through) whatever the image.
+# default: "images:debian/13"
+image = "images:debian/13"
+
+# incus profiles applied to the container.
+# default: ["default"]
+profiles = ["default"]
+
+# Storage pool for the root disk and the Postgres data volume.
+# default: "default"
+storage_pool = "default"
+
+# Managed bridge the container's NIC is on.
+# default: "incusbr0"
+network = "incusbr0"
+
+# Name of the NIC device to pin the IP on ('auto' = the nic device from the profile(s)).
+# default: "auto"
+nic_device = "auto"
+
+# Static IPv4 for the container. 'auto' keeps whatever DHCP hands out first and pins it.
+# default: "auto"
+ipv4 = "auto"
+
+# Login user inside the container (VSCode server, terminals, agents). Its sudo rights:
+# container.sudo. Deliberately a generic name, not your host login: only container.uid
+# has to line up with the host, and a host-derived name would end up in files you
+# commit. You never type it (the ssh config block carries it), so `ssh <ssh.host_alias>`
+# just works.
+# default: "dev"
+user = "dev"
+
+# uid of that user. 'auto' = your host uid, which makes the shared folder's ownership
+# line up.
+# default: "auto"
+uid = "auto"
+
+# What the container user may do as root. 'limited': only `sudo devstack-sync` (install
+# listed apt packages, restart the app/runners, reload Caddy), so nothing the user or an
+# agent can edit runs as root. 'full': passwordless sudo for everything (the user, and
+# every agent running as it, is root in the container; needs your OK). 'none': no sudo.
+# Root for you is always `incus exec <container> -- bash` from the host.
+# choices: limited, full, none
+# default: "limited"
+sudo = "limited"
+
+# incus limits.cpu (e.g. '4'); empty = no limit.
+# default: ""
+cpu_limit = ""
+
+# incus limits.memory (e.g. '8GiB'); empty = no limit.
+# default: ""
+memory_limit = ""
+
+# Extra host folders to mount, e.g. a shared data folder. Each entry: name, source (host
+# path), path (container path), readonly (default false), shift (default true). Entries
+# added after the container exists are added by the next `up`.
+# [[container.mounts]]
+# name = "data"
+# source = "~/data"
+# path = "/srv/data"
+# readonly = false
+
+# The incus network ACL that keeps the whole container off the host and the LAN.
+# Enforced on the host, so nothing inside the container (not even root) can change it.
+[network]
+# Attach an incus network ACL to the container's NIC that rejects traffic to the host
+# (except DNS and DHCP on the bridge gateway), the LAN and other private ranges.
+# Internet access stays.
+# default: true
+acl = true
+
+# Name of that incus network ACL.
+# default: "devstack-{stack.name}"
+acl_name = "devstack-{stack.name}"
+
+# CIDRs the container may still reach despite the ACL, e.g. ['192.168.1.20/32'] for a
+# NAS. Anything here needs your OK.
+# default: []
+allow_private = []
+
+# Optional GPU passthrough into the container. Off by default.
+[gpu]
+# Pass the host GPU into the container.
+# default: false
+enabled = false
+
+# PCI address of one GPU (from `incus info --resources`); empty = all.
+# default: ""
+pci = ""
+
+# Set nvidia.runtime=true so the host's NVIDIA userspace libs are injected (requires
+# nvidia-container-toolkit on the host).
+# default: true
+nvidia_runtime = true
+
+# incus snapshots taken before each phase; they are what makes container changes
+# undoable.
+[snapshots]
+# 'per-phase': snapshot before every phase after 'base' so it can be undone. 'off': no
+# snapshots; then only `undo --all` can revert container changes.
+# choices: per-phase, off
+# default: "per-phase"
+mode = "per-phase"
+
+# 'manual': keep phase snapshots until `devstack snapshot prune`. 'auto': prune once
+# `up` finishes with everything verified. Pruned phases can only be undone with `undo
+# --all`. On the 'dir' storage driver every snapshot is a full rootfs copy.
+# choices: manual, auto
+# default: "manual"
+cleanup = "manual"
+
+# Name prefix of phase snapshots.
+# default: "devstack-pre-"
+prefix = "devstack-pre-"
+
+# ssh access from the host (and VSCode Remote-SSH) into the container.
+[ssh]
+# Private key used for this container (created if missing).
+# default: "~/.ssh/{container.name}_ed25519"
+key_path = "~/.ssh/{container.name}_ed25519"
+
+# 'none': key without passphrase (it only opens this local container). 'prompt': ssh-
+# keygen asks (interactive only; add it to your agent with ssh-add).
+# choices: none, prompt
+# default: "none"
+key_passphrase = "none"
+
+# Allow using a key at ssh.key_path that devstack did not create (it is then never
+# deleted).
+# default: false
+reuse_existing_key = false
+
+# Host alias for `ssh <alias>` and VSCode Remote-SSH.
+# default: "{container.name}"
+host_alias = "{container.name}"
+
+# ssh client config that gets a marked block for this stack.
+# default: "~/.ssh/config"
+config_file = "~/.ssh/config"
+
+# Per-stack known_hosts file (pinned from incus, so no trust-on-first-use).
+# default: "~/.ssh/known_hosts.d/devstack-{stack.name}"
+known_hosts_file = "~/.ssh/known_hosts.d/devstack-{stack.name}"
+
+# Node.js inside the container (download verified with gpg + sha256).
+[node]
+# Exact Node.js version (verified with the release keys).
+# default: "24.20.0"
+version = "24.20.0"
+
+# pnpm version for corepack (`corepack use pnpm@<v>` pins it, with its hash, in
+# package.json's packageManager). Exact and at least a week old, like the dependencies
+# pnpm-workspace.yaml lets in; 'latest' takes whatever was published last. 10.26.0 or
+# later.
+# default: "12.8.2"
+pnpm_version = "12.8.2"
+
+# Where the Node tarball is unpacked.
+# default: "/usr/local"
+install_prefix = "/usr/local"
+
+# Host DNS through dnsmasq. The host must already resolve through dnsmasq (see
+# index.html); devstack only adds/removes one drop-in file per stack.
+[dns]
+# Dev TLD appended to site.hostname: app.example.com -> app.example.com.<tld>. Empty =
+# use site.hostname itself (single-domain override).
+# default: "{container.name}"
+tld = "{container.name}"
+
+# Allow dns.tld to be a real, delegated top-level domain (com, dev, app, ...). Off by
+# default: the wildcard would then stop every site under that TLD from resolving on this
+# host. Prefer 'internal' (reserved for private use) or any unused name.
+# default: false
+allow_public_tld = false
+
+# address=/<tld>/ip: every name under the TLD goes to the container. False = exact host-
+# record lines only.
+# default: true
+wildcard = true
+
+# Extra exact host names that should resolve to the container (host-record).
+# default: []
+extra_names = []
+
+# dnsmasq drop-in directory.
+# default: "/etc/dnsmasq.d"
+dnsmasq_dir = "/etc/dnsmasq.d"
+
+# The one file devstack writes for this stack.
+# default: "{dns.dnsmasq_dir}/devstack-{stack.name}.conf"
+dnsmasq_file = "{dns.dnsmasq_dir}/devstack-{stack.name}.conf"
+
+# systemd unit restarted after changes.
+# default: "dnsmasq"
+dnsmasq_service = "dnsmasq"
+
+# The app's public identity.
+[site]
+# The app's intended production hostname. Dev URL = https://<hostname>.<dns.tld>.
+# default: "app.example.com"
+hostname = "app.example.com"
+
+# The local CA: its root key stays on the host and is limited to the dev domain; Caddy
+# only gets an intermediate. How the host trusts the root.
+[tls]
+# Where devstack's local root CA (name-constrained to the dev domain) is installed on
+# the host (system trust store).
+# default: "/usr/local/share/ca-certificates/devstack-{stack.name}.crt"
+host_ca_file = "/usr/local/share/ca-certificates/devstack-{stack.name}.crt"
+
+# Also import the CA into your everyday browser's NSS db (~/.pki/nssdb, used by
+# Chromium/Chrome). 'no' (default): only the dev browser (`devstack browse`) trusts it,
+# from its own NSS db, so your browser shows a certificate error on dev sites, a
+# reminder that their pages are untrusted. 'auto' = import if certutil and the db exist,
+# else print manual steps; 'yes' = import or fail.
+# choices: auto, yes, no
+# default: "no"
+browser_trust = "no"
+
+# NSS database directory.
+# default: "~/.pki/nssdb"
+nss_db = "~/.pki/nssdb"
+
+# Certificate nickname in the NSS db.
+# default: "devstack-{stack.name}"
+nss_nickname = "devstack-{stack.name}"
+
+# `devstack browse`: a Chromium confined to the dev domain, with its own profile and its
+# own trust in the dev CA. Pages the container serves are untrusted; open them here, not
+# in your browser.
+[browser]
+# Chromium (or Chrome) for `devstack browse`. Empty = the first of chromium, chromium-
+# browser, google-chrome-stable, google-chrome on PATH.
+# default: ""
+binary = ""
+
+# Reverse proxy / static file server inside the container.
+[caddy]
+# Generate <project>/infra/Caddyfile. Set false to maintain it yourself (it must then
+# exist before phase 'proxy').
+# default: true
+manage_caddyfile = true
+
+# Static root.
+# default: "{project.container_path}/static"
+static_dir = "{project.container_path}/static"
+
+# Error / catch-all page root.
+# default: "{project.container_path}/error"
+error_dir = "{project.container_path}/error"
+
+# Caddy's admin API (phase isolation). A unix socket in /run/caddy (mode 0700: caddy and
+# root only), so no local process can replace Caddy's config through the unauthenticated
+# 127.0.0.1:2019.
+# default: "unix//run/caddy/admin.sock"
+admin = "unix//run/caddy/admin.sock"
+
+# Which browser requests the site accepts: the snippet devstack_same_origin, defined in
+# the root-owned /etc/caddy/Caddyfile and imported by every site block. 'strict': only
+# the site's own pages; a request a browser marks as coming from another site (a foreign
+# Origin, or Sec-Fetch-Site cross-site or same-site) gets a bare 403. Typed URLs,
+# bookmarks and tools that send no browser headers (curl, agents) pass. 'allow-
+# navigation': also top-level GET navigations from other sites (links in, OAuth or
+# payment redirects back). 'off': no check. No CORS headers in any mode.
+# choices: strict, allow-navigation, off
+# default: "strict"
+same_origin = "strict"
+
+# Largest request body the site accepts (Caddy request_body max_size, e.g. '10MB',
+# '4GiB'); bigger requests get 413. Empty = no limit. Written into the generated
+# Caddyfile only.
+# default: ""
+max_request_body = ""
+
+# Security headers (phase standards). The error page's inline <style> hash is added to
+# style-src automatically.
+[caddy.headers]
+Content-Security-Policy = "default-src 'self'; style-src 'self'; worker-src 'self' blob:; script-src 'self'; img-src 'self' data:; frame-src 'self'; connect-src 'self'; font-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'; media-src blob: 'self'; object-src 'none'; upgrade-insecure-requests;"
+Referrer-Policy = "strict-origin-when-cross-origin"
+Strict-Transport-Security = "max-age=63072000; includeSubDomains; preload"
+X-Content-Type-Options = "nosniff"
+X-Frame-Options = "DENY"
+Cross-Origin-Opener-Policy = "same-origin"
+Cross-Origin-Resource-Policy = "same-origin"
+Permissions-Policy = "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=(), interest-cohort=()"
+
+# Dev servers in the container (Vite, Storybook, ...), each served by Caddy at
+# https://<name>.<dev host>/ with /api/* going to the app, so the page and its API share
+# one origin. name = "port", e.g. { vite = "5173" }; the server listens on localhost in
+# the container. Reach them with the dev browser (`devstack browse vite`), not a
+# forwarded port: it can't reach your host's loopback. No security headers there: a dev
+# server's inline scripts and HMR websocket would break the CSP.
+[caddy.dev_servers]
+
+# The app service (scaffolded smoke-test server, systemd hardened), its network profile,
+# its data folder, and runners: socket-activated tools that may use the internet.
+[app]
+# systemd unit name (without .service).
+# default: "{stack.name}-app"
+service_name = "{stack.name}-app"
+
+# Listen address. Loopback only, by design.
+# choices: 127.0.0.1, ::1
+# default: "127.0.0.1"
+bind = "127.0.0.1"
+
+# Listen port.
+# default: 8080
+port = 8080
+
+# Entry file, relative to the project folder.
+# default: "server.ts"
+entry = "server.ts"
+
+# What the app may reach going out, enforced by nftables on its uid. 'local': loopback
+# only (Caddy, Postgres, runners), no DNS. 'internet': loopback plus the public internet
+# (never the host or private ranges). 'open': no restriction (needs your OK).
+# choices: local, internet, open
+# default: "local"
+profile = "local"
+
+# The app's writable data folder at /var/lib/<isolation.app_user> ($STATE_DIRECTORY in
+# the app). 'volume': an incus custom volume (app.data_volume) that survives rebuilds
+# like the Postgres data. 'host': a host folder (app.data_source); files in it belong to
+# the service uid, so your host user can't read them without sudo. 'none': the app has
+# no writable folder.
+# choices: volume, host, none
+# default: "volume"
+data = "volume"
+
+# incus custom volume for app.data = 'volume'. Survives undo/destroy; only `--purge-
+# data` deletes it.
+# default: "{stack.name}-appdata"
+data_volume = "{stack.name}-appdata"
+
+# Host folder for app.data = 'host'.
+# default: ""
+data_source = ""
+
+# Use an existing app.data_volume devstack did not create. Adopted volumes are never
+# deleted.
+# default: false
+data_adopt = false
+
+# Host folder for `devstack data backup` archives.
+# default: "~/.local/share/devstack/{stack.name}/backups"
+data_backup_dir = "~/.local/share/devstack/{stack.name}/backups"
+
+# Archive the app data automatically before undoing the isolation phase or destroying
+# the container.
+# default: true
+data_backup_before_undo = true
+
+# Runners: tools that need the internet or parse untrusted files, without a daemon. Each
+# entry: name, command (project-relative, run as isolation.runner_user), port (127.0.0.1
+# only), and optionally memory_max (default '1G'), runtime_max (default '1h'),
+# max_connections (default 4). Every connection to the port starts one job with the
+# connection as stdin/stdout. Runners get the public internet, no loopback, no secrets,
+# and can only write <app data>/incoming. A new or changed runner needs your OK.
+# [[app.runners]]
+# name = "fetch"
+# command = "node scripts/runner.ts"
+# port = 9101
+# memory_max = "2G"
+# runtime_max = "2h"
+# max_connections = 2
+
+# ufw inside the container (phase isolation): what may come in. What services may reach
+# going out is app.profile.
+[firewall]
+# Enable ufw in the container.
+# default: true
+enabled = true
+
+# TCP ports allowed in.
+# default: [22, 80, 443]
+allow = [22, 80, 443]
+
+# Extra TCP ports denied (app.port, postgres.port and runner ports are always denied).
+# default: []
+deny = []
+
+# Fixed system users and groups for the services (phase isolation). Fixed ids keep file
+# owners on persistent volumes and let the egress profiles match a uid that never
+# changes.
+[isolation]
+# First of four fixed ids: app uid = base, runner uid/gid = base+1, data gid = base+2,
+# dev gid = base+3. Mid-range on purpose, like postgres.system_uid: Debian hands out
+# system ids downward from 999.
+# default: 510
+system_uid_base = 510
+
+# System user the app runs as.
+# default: "{stack.name}-app"
+app_user = "{stack.name}-app"
+
+# System user runner jobs run as.
+# default: "{stack.name}-runner"
+runner_user = "{stack.name}-runner"
+
+# Group that can read the app data (the app's group; the container user is a member).
+# default: "{stack.name}-data"
+data_group = "{stack.name}-data"
+
+# Group that can read the internal token (for dev servers that call the API directly).
+# default: "{stack.name}-dev"
+dev_group = "{stack.name}-dev"
+
+# Where generated secrets live inside the container (root-only, except that the dev
+# group can read the internal token).
+[secrets]
+# Root-only secrets folder in the container.
+# default: "/etc/app-secrets"
+dir = "/etc/app-secrets"
+
+# Caddy -> app shared token (INTERNAL_TOKEN=...).
+# default: "internal-token.env"
+token_file = "internal-token.env"
+
+# `devstack checkpoint`: undo everything after provisioning (an agent's changes, a bad
+# install) by restoring the container, its data volumes and the project together.
+[checkpoint]
+# How many checkpoints to keep. `checkpoint create` makes the new one first, then
+# deletes the oldest beyond this (after asking). On the 'dir' storage driver each one is
+# a full copy of the container and the data volumes.
+# default: 1
+keep = 1
+
+# Ignored folders (any depth) a checkpoint leaves out because checkpoint.restore_command
+# rebuilds them.
+# default: ["node_modules", "dist", "build", ".next", ".turbo", ".cache"]
+derived = ["node_modules", "dist", "build", ".next", ".turbo", ".cache"]
+
+# Ignored files outside checkpoint.derived (.env, local scratch data) are copied into
+# the checkpoint up to this many MB in all; the rest is listed as not captured.
+# default: 20
+capture_max_mb = 20
+
+# Run in the project folder in the container (as the container user) after a restore, to
+# rebuild checkpoint.derived. Empty = nothing.
+# default: "test ! -f package.json || pnpm install --frozen-lockfile"
+restore_command = "test ! -f package.json || pnpm install --frozen-lockfile"
+
+# Postgres, local-only, with its data on a separate incus volume that survives
+# undo/destroy/rebuild.
+[postgres]
+# Run the postgres phase.
+# default: true
+enabled = true
+
+# Major version from apt.postgresql.org.
+# default: 18
+version = 18
+
+# Port (loopback only).
+# default: 5432
+port = 5432
+
+# incus custom volume mounted at /var/lib/postgresql. Survives undo/destroy; only
+# `--purge-data` deletes it.
+# default: "{stack.name}-pgdata"
+volume = "{stack.name}-pgdata"
+
+# Use an existing volume devstack did not create (e.g. after deleting the state dir).
+# Adopted volumes are never deleted by devstack.
+# default: false
+adopt_volume = false
+
+# Fixed uid/gid of the postgres OS user, so data on a reused volume keeps its owner.
+# Mid-range on purpose: Debian hands out system ids downward from 999.
+# default: 500
+system_uid = 500
+
+# App database name.
+# default: "{stack.name_sql}"
+db = "{stack.name_sql}"
+
+# App login role.
+# default: "{stack.name_sql}_app"
+role = "{stack.name_sql}_app"
+
+# Empty database for integration tests, owned by the app role ("" = none). Not backed
+# up. The container user gets its URL as TEST_DATABASE_URL in
+# ~/.config/devstack/<stack>.env.
+# default: "{postgres.db}_test"
+test_db = "{postgres.db}_test"
+
+# Credentials file in secrets.dir (DATABASE_URL, PG* vars), given to the app unit.
+# default: "postgres.env"
+env_file = "postgres.env"
+
+# Write ~/.pgpass for the container user so `psql` just works.
+# default: true
+write_pgpass = true
+
+# Host folder for `devstack db backup` dumps.
+# default: "~/.local/share/devstack/{stack.name}/backups"
+backup_dir = "~/.local/share/devstack/{stack.name}/backups"
+
+# pg_dump automatically before undoing the postgres phase or destroying the container.
+# default: true
+backup_before_undo = true
+
+# Software bill of materials: a CycloneDX inventory generated by syft inside the
+# container and committed with the project, plus vulnerability scanning by grype on the
+# host (its database never enters the container).
+[sbom]
+# Install syft in the container (phase base) and keep the CycloneDX files in sbom.dir
+# current. false = no download from GitHub during base, and no SBOM at all.
+# default: true
+enabled = true
+
+# Regenerate the SBOM at the end of a successful `up`. A failure there is a warning,
+# never a failed phase: `devstack sbom generate` redoes it.
+# default: true
+generate_on_up = true
+
+# Folder inside the project for the generated CycloneDX files (container.cdx.json,
+# app.cdx.json). Relative to the project folder, and committed with it.
+# default: "infra/sbom"
+dir = "infra/sbom"
+
+# How the app inventory is taken. 'lockfile': scan the project without node_modules
+# (pnpm-lock.yaml is authoritative and deterministic). 'tree': also scan node_modules,
+# for a project whose packages the lockfile parser misses.
+# choices: lockfile, tree
+# default: "lockfile"
+app_source = "lockfile"
+
+# Lowest grype severity that makes `devstack sbom scan` exit 5. Empty = report only,
+# never fail.
+# choices: , negligible, low, medium, high, critical
+# default: ""
+fail_on = ""
+
+# Count only vulnerabilities that have a fix available towards sbom.fail_on. On by
+# default: a finding with no fix is not actionable (Debian carries many), and gating on
+# those makes the gate permanently red. Everything is still reported either way.
+# default: true
+only_fixed = true
+
+# Vulnerability ids (CVE/GHSA) that `sbom scan` must not count towards sbom.fail_on.
+# Each one is a decision: record why in the project's README.
+# default: []
+ignore = []
+
+# Host folder for the grype binary and its vulnerability database (~1 GB). Never in the
+# project, and it survives undo/destroy like the other caches.
+# default: "{host.state_dir}/grype"
+db_dir = "{host.state_dir}/grype"
+
+# `devstack leaks scan`: secret scanning by gitleaks on the host, over the project's git
+# history and its uncommitted files. Only devstack's own gitleaks config is used; the
+# project's is writable from the container and is never read.
+[leaks]
+# `devstack leaks scan` covers every commit, not only the files as they are now. false =
+# uncommitted and current files only (faster on a long history).
+# default: true
+history = true
+
+# Finding fingerprints (as `leaks scan` prints them) that must not fail the scan. Only
+# for false positives: a real secret is rotated, not ignored.
+# default: []
+ignore = []
+
+# Host folder for the gitleaks binary. Never in the project.
+# default: "{host.state_dir}/gitleaks"
+tool_dir = "{host.state_dir}/gitleaks"

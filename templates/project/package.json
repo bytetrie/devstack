@@ -1,0 +1,12 @@
+{
+  "name": "@@PKG_NAME@@",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node @@ENTRY@@",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint --max-warnings 0 .",
+    "lint:changed": "scripts/lint-changed.sh",
+    "check": "pnpm typecheck && pnpm lint"
+  }
+}

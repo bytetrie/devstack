@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="generator" content="devstack-error" />
+    <title>Not here</title>
+    <!-- Inline on purpose: Caddy rewrites every error request to this file, so it
+         can't load other assets. devstack hashes this <style> into the CSP. -->
+    <style>* {background: #101010; color: #00DD20; font-family: monospace}</style>
+  </head>
+  <body>
+    <h1>Nothing here.</h1>
+    <p>This host or path isn't served by @@STACK@@.</p>
+  </body>
+</html>

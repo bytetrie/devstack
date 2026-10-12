@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+# local configs and generated state; devstack.example.toml is the tracked reference
+/devstack.toml
+*.log

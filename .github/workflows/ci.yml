@@ -1,0 +1,31 @@
+name: ci
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 4 * * 1"   # weekly: the pin check needs the network, so it is not on PRs
+  workflow_dispatch:
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: bash -n devstack
+      - run: python -m py_compile devstack.py
+      - run: ./devstack config check -c devstack.example.toml
+      - run: python -m unittest discover -s tests -v
+
+  # Is each pinned download still the artifact we pinned? Needs the network, so it is kept off pull
+  # requests: a docs change must not be blocked by GitHub rate limits or a flaky download.
+  pins:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python tests/verify_pins.py

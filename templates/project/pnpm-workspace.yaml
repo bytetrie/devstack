@@ -1,0 +1,33 @@
+# pnpm settings for this project, scaffolded by devstack. pnpm reads them on every install, add,
+# update and CI run. They decide what may enter node_modules, so a change here gets the same
+# review as a new dependency. Needs pnpm 10.26 or later (package.json's packageManager pins it).
+
+# Only versions published at least 7 days ago (in minutes). Most malicious releases are found
+# and pulled within hours. Set explicitly, so it is strict: pnpm fails instead of falling back
+# to a newer version.
+minimumReleaseAge: 10080
+# Your own scopes, if they must install the moment they are published:
+# minimumReleaseAgeExclude:
+#   - "@yourorg/*"
+
+# Transitive dependencies come from the registry only, never from a git repo or a tarball URL.
+blockExoticSubdeps: true
+
+# Refuse a version whose publishing trust is weaker than an earlier release's (e.g. trusted
+# publishing before, a plain token now): the pattern of a hijacked maintainer account.
+trustPolicy: no-downgrade
+# If an old package trips it, skip the check for versions older than a year (in minutes), or
+# exclude one exact version with trustPolicyExclude. Record why in README.md.
+# trustPolicyIgnoreAfter: 525600
+
+# A dependency with an install script that is not listed under allowBuilds fails the install.
+strictDepBuilds: true
+# Install scripts stay off. pnpm adds an entry here when it meets a package with one; set it to
+# true only for a package that really needs its build step, after reading what the script does.
+# allowBuilds:
+#   esbuild: true
+
+# pnpm 12.11+ can link "agent skills" that packages ship into .claude/skills and similar folders,
+# where coding agents read them as instructions. Uncomment to keep that off:
+# skills:
+#   dirs: []
