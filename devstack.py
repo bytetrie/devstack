@@ -6261,7 +6261,7 @@ def cmd_snapshot(ctx: Ctx, args: argparse.Namespace) -> int:
                     "checkpoint (devstack checkpoint)" if s["name"].startswith(CHECKPOINT_PREFIX) else
                     "manual (not managed by devstack)")
             print(f"  {s['name']:<32} {s.get('created_at', '')[:19]}  {role}")
-        print("\nrollback: ./devstack undo [--to PHASE]   cleanup: ./devstack snapshot prune")
+        print("\nrollback: ./devstack undo [--to PHASE]   cleanup: ./devstack snapshot prune | delete NAME")
         return 0
     with Lock(ctx):
         if args.action == "create":
@@ -6270,6 +6270,21 @@ def cmd_snapshot(ctx: Ctx, args: argparse.Namespace) -> int:
                                   f"{CHECKPOINT_PREFIX}")
             ctx.r.run(["incus", "snapshot", "create", ctx.name, args.name], stream=True)
             log.info("created %s/%s (restore: incus snapshot restore %s %s)", ctx.name, args.name, ctx.name, args.name)
+            return 0
+        if args.action == "delete":
+            # Only manual snapshots (incl. pre-upgrade-*): phase snapshots are undo points in the
+            # journal and checkpoints have volume snapshots and a project copy beside them.
+            if args.name.startswith(c["snapshots.prefix"]):
+                raise ConfigError(f"{args.name} is a phase snapshot (an undo point): use `devstack snapshot prune`")
+            if args.name.startswith(CHECKPOINT_PREFIX):
+                raise ConfigError(f"{args.name} belongs to a checkpoint: use `devstack checkpoint delete "
+                                  f"{args.name.removeprefix(CHECKPOINT_PREFIX)}`")
+            if ctx.instance() is None or args.name not in ctx.snapshot_names():
+                raise ConfigError(f"no snapshot {ctx.name}/{args.name} (devstack snapshot list)")
+            if not ctx.confirm(f"Delete snapshot {ctx.name}/{args.name}?", destructive=True):
+                return 0
+            ctx.r.run(["incus", "snapshot", "delete", ctx.name, args.name])
+            log.info("deleted snapshot %s/%s", ctx.name, args.name)
             return 0
         if not ctx.confirm("Delete the phase snapshots of all done phases? Those phases can then only be undone "
                            "with `undo --all`.", destructive=True):
@@ -7551,8 +7566,8 @@ def build_parser() -> argparse.ArgumentParser:
             g.add_argument("--to", metavar="PHASE", help="undo every phase after PHASE")
             g.add_argument("--all", action="store_true", help="undo everything (same as destroy)")
         p.add_argument("--purge-data", action="store_true", help="also delete the Postgres data volume")
-    p = sub.add_parser("snapshot", parents=[common], help="list | create NAME | prune")
-    p.add_argument("action", choices=("list", "create", "prune"))
+    p = sub.add_parser("snapshot", parents=[common], help="list | create NAME | delete NAME | prune")
+    p.add_argument("action", choices=("list", "create", "delete", "prune"))
     p.add_argument("name", nargs="?")
     p = sub.add_parser("db", parents=[common], help="backup [FILE] | restore FILE | shell")
     p.add_argument("action", choices=("backup", "restore", "shell"))
@@ -7603,8 +7618,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "checkpoint" and args.action in ("restore", "delete") and not args.name:
             raise ConfigError(f"checkpoint {args.action} needs a NAME (devstack checkpoint list)")
-        if args.command == "snapshot" and args.action == "create" and not args.name:
-            raise ConfigError("snapshot create needs a NAME")
+        if args.command == "snapshot" and args.action in ("create", "delete") and not args.name:
+            raise ConfigError(f"snapshot {args.action} needs a NAME")
         if args.command in ("db", "data") and args.action == "restore" and not args.file:
             raise ConfigError(f"{args.command} restore needs a FILE")
         if args.command == "config" and args.action != "explain" and args.key:

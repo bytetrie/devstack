@@ -2226,6 +2226,44 @@ class UpgradeTests(unittest.TestCase):
         self.assertEqual((args.command, args.dry_run, args.no_snapshot), ("upgrade", True, True))
 
 
+class SnapshotDeleteTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.runner = FakeRunner()
+        self.ctx = make_ctx(Path(self._tmp.name), self.runner)
+        self.ctx.instance = lambda name=None: {"status": "Running", "devices": {}}
+        self.ctx.snapshot_names = lambda name=None: ["mine", "pre-upgrade-20260101-000000",
+                                                     "devstack-pre-network", "checkpoint-one"]
+        self.ctx.args.yes = True
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def delete(self, name):
+        return ds.cmd_snapshot(self.ctx, argparse.Namespace(action="delete", name=name))
+
+    def test_deletes_manual_and_pre_upgrade_snapshots(self):
+        self.assertEqual(self.delete("mine"), 0)
+        self.assertEqual(self.delete("pre-upgrade-20260101-000000"), 0)
+        self.assertEqual(self.runner.calls, [["incus", "snapshot", "delete", "devbox", "mine"],
+                                             ["incus", "snapshot", "delete", "devbox", "pre-upgrade-20260101-000000"]])
+
+    def test_refuses_undo_points_checkpoints_and_unknown_names(self):
+        for name in ("devstack-pre-network", "checkpoint-one", "nope"):
+            with self.subTest(name=name), self.assertRaises(ds.ConfigError):
+                self.delete(name)
+        self.assertEqual(self.runner.calls, [])
+
+    def test_needs_a_yes(self):
+        self.ctx.args.yes = False
+        with self.assertRaises(ds.NeedsInput):
+            self.delete("mine")
+        self.assertEqual(self.runner.calls, [])
+
+    def test_cli_needs_a_name(self):
+        self.assertEqual(ds.main(["snapshot", "delete"]), ds.ConfigError("").exit_code)
+
+
 class SbomScopeTests(unittest.TestCase):
     def ctx(self, **over):
         d = tempfile.mkdtemp()

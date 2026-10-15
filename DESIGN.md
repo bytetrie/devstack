@@ -221,6 +221,8 @@ Assume nothing beyond: Debian-family host, bash, `sudo`.
       sbom … [container|app]   default: both
   snapshot list       devstack + manual snapshots, size hint, which phase needs it
   snapshot create NAME  manual snapshot (outside the journal, never auto-deleted)
+  snapshot delete NAME  delete a manual or pre-upgrade snapshot (asks/needs --yes;
+                      refuses phase snapshots and checkpoints)
   snapshot prune      delete phase snapshots of done phases (asks/needs --yes;
                       those phases can then only be undone with undo --all)
   db backup [FILE]    pg_dump -Fc of the app db to host backup_dir
@@ -396,7 +398,8 @@ of phases that have been undone are deleted.
 - `snapshots.mode = "off"` never takes them, with the same consequence.
 - The `base` phase needs no snapshot: its undo deletes the container.
 - Manual snapshots (`devstack snapshot create`) don't use the prefix, aren't in
-  the journal and are only deleted with the container. Restoring one is a plain
+  the journal and are only deleted with the container or by `devstack snapshot
+  delete NAME` (which refuses the prefix and `checkpoint-`). Restoring one is a plain
   `incus restore` — the guide warns that this can make `state.json` disagree
   with the container, and that `up` re-verifies phases afterwards.
 - Custom volumes (Postgres data) are **not** part of instance snapshots. That is
