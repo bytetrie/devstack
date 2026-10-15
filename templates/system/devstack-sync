@@ -10,13 +10,13 @@
 #
 #   sudo devstack-sync packages < infra/apt-packages.txt   install what's missing
 #   devstack-sync check-packages < infra/apt-packages.txt  validate only (no root)
-#   sudo devstack-sync restart app | restart runners
+#   sudo devstack-sync restart app | restart runners | restart services
 #   sudo devstack-sync validate caddy                      check the Caddyfiles, change nothing
 #   sudo devstack-sync reload caddy                        validate, then reload
 #   sudo devstack-sync status
 #
-# Everything else (runners, egress profiles, app data, mounts, apt repos, sudo,
-# host ACL exceptions) is applied from the host by `devstack up`.
+# Everything else (runners, services, egress profiles, app data, mounts, apt repos,
+# sudo, GPU access, host ACL exceptions) is applied from the host by `devstack up`.
 set -euo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export LC_ALL=C
@@ -25,6 +25,8 @@ cd /
 
 app_unit=@@APP_UNIT@@
 runner_sockets=(@@RUNNER_SOCKETS@@)
+service_units=(@@SERVICE_UNITS@@)
+gpu_unit=@@GPU_UNIT@@
 max_input=65536
 # Debian package names, minus a trailing '-': `apt-get install foo-` REMOVES foo.
 name_rx='^[a-z0-9][a-z0-9+.-]*[a-z0-9+]$'
@@ -145,6 +147,9 @@ cmd_restart() {
     runners)
       if [ "${#runner_sockets[@]}" -eq 0 ]; then echo "no runners configured"; return 0; fi
       systemctl restart "${runner_sockets[@]}" ;;
+    services)
+      if [ "${#service_units[@]}" -eq 0 ]; then echo "no services configured"; return 0; fi
+      systemctl restart "${service_units[@]}" ;;
     *) usage ;;
   esac
 }
@@ -171,7 +176,8 @@ cmd_reload_caddy() {
 cmd_status() {
   need_root status
   local u
-  for u in devstack-egress.service "$app_unit" caddy.service "${runner_sockets[@]}"; do
+  for u in devstack-egress.service ${gpu_unit:+"$gpu_unit"} "$app_unit" caddy.service "${runner_sockets[@]}" \
+    "${service_units[@]}"; do
     printf '%-40s %s\n' "$u" "$(systemctl is-active "$u" 2>/dev/null || true)"
   done
   echo
@@ -186,7 +192,7 @@ cmd_status() {
 case "$1:$#" in
   packages:1) cmd_packages ;;
   check-packages:1) cmd_check ;;
-  restart:2) case $2 in app | runners) cmd_restart "$2" ;; *) usage ;; esac ;;
+  restart:2) case $2 in app | runners | services) cmd_restart "$2" ;; *) usage ;; esac ;;
   validate:2) [ "$2" = caddy ] || usage; cmd_validate_caddy ;;
   reload:2) [ "$2" = caddy ] || usage; cmd_reload_caddy ;;
   status:1) cmd_status ;;

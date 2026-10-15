@@ -44,8 +44,11 @@ previous one:
    heavily restricted systemd service under a fixed system user whose outbound
    traffic is limited by an nftables egress profile (loopback only by default).
    Tools that need the internet run as socket-activated runners with their own
-   user and profile. The login user gets no general root, and Caddy's admin API
-   is off TCP. Nothing the login user can edit runs as root.
+   user and profile; long-running tools that aren't Debian packages (a model
+   server) run as `container.services`, each a pinned download under its own
+   user and profile. A passed-through GPU is hidden from everything but the
+   services that ask for it. The login user gets no general root, and Caddy's
+   admin API is off TCP. Nothing the login user can edit runs as root.
 6. **Data** — Postgres, local-only with password auth, and its data kept outside
    the container so it survives rebuilds.
 
@@ -58,7 +61,7 @@ previous one:
 | 3 | `app`       | serve     | minimal zero-dep TypeScript smoke-test app scaffolded in the project                      |
 | 4 | `proxy`     | proxy     | Caddy + local CA, host DNS for the dev TLD, host trusts the CA                            |
 | 5 | `standards` | standards | precompressed static files, `encode`, security headers / CSP                              |
-| 6 | `isolation` | isolation | ufw, service users, nftables egress profiles, app data volume, runners, `devstack-sync`, Caddy admin socket + internal token, hardened systemd unit, header hiding |
+| 6 | `isolation` | isolation | ufw, service users, nftables egress profiles, app data volume, runners, services, GPU kept for GPU services, `devstack-sync`, Caddy admin socket + internal token, hardened systemd unit, header hiding |
 
 The tool is the **repro recipe**: the project's git repo (with its
 `infra/devstack-requires.toml`) + this folder + a personal `devstack.toml` made
@@ -119,6 +122,8 @@ long-running services.
 | Outbound-capable tools | Socket-activated runners: one short-lived job per connection, no daemon, no secrets | Nothing to keep running; each job is limited and disposable |
 | Domain allow-lists / egress proxy | Not now | Can't be enforced at the netfilter layer; "public internet only" doesn't need it. A future egress-proxy profile would (§12) |
 | Agents installing apt packages | Allowed via `devstack-sync packages`: Debian repos only, list in git (`infra/apt-packages.txt`) | Signed packages; every change is a reviewable line; new repos and services still need the host |
+| Long-running tools that aren't Debian packages (e.g. Ollama) | `[[container.services]]`: url + sha256 in the config (not in `devstack.py`), installed root-owned under `/opt/devstack/services`, own user + egress profile + hardened unit, applied by `up` | No `curl \| sh` as root and no daemon as the login user (it would get everything the login user has: internet, the database, the project). Pins for tools the project chooses belong to the project's config, not to devstack's trust roots |
+| GPU access in the container | Hidden from everything by default (`gpu.login_user = false`); only services with `gpu = true` get the device nodes | The NVIDIA driver runs in the host's kernel. Owner/mode can't gate it: with `nvidia.runtime` the nodes are the host's own, world-writable, bind-mounted in and owned by an unmapped uid. So the nodes are moved out of sight at boot and bound back per service (§8.5 step 9a) |
 | Login user's access to app data | Read-only | Least privilege; writes go through the app, which keeps its invariants (rows ↔ files) |
 | App data storage | incus custom volume by default; host folder optional | Survives rebuilds; a host folder holds files owned by the shifted service uid, unreadable for the host user |
 | Caddyfile | Stays project-editable; global options (admin socket) are devstack's | Routes and CSP change with the app and are in git; the real hole was the unauthenticated admin port |
@@ -146,8 +151,9 @@ run/setup/
   templates/               files rendered into the project / container
     project/               scaffold: server.ts, static/, error/, package.json, README.md,
                            AGENTS.md (what the container enforces, for coding agents) ...
-    system/                sshd drop-in, app unit, runner socket + service, egress.nft +
-                           devstack-egress.service, devstack-sync, pg_hba, pg conf ...
+    system/                sshd drop-in, app unit, runner socket + service, service unit,
+                           egress.nft + devstack-egress.service, devstack-sync,
+                           devstack-gpu (+ .service), pg_hba, pg conf ...
 ```
 
 Rule for agents: **templates hold file content, devstack.py holds logic.**
@@ -837,7 +843,8 @@ can't reach by design.
    `<stack>-app` (uid base, primary group `<stack>-data`), `<stack>-runner`
    (uid/gid base+1, its own group, **not** in `<stack>-data`), groups
    `<stack>-data` (base+2) and `<stack>-dev` (base+3). The login user joins both
-   groups. `nologin`, no home.
+   groups. `nologin`, no home. Each `container.services` entry gets
+   `<stack>-<name>` (uid = gid = base+4+its position), in no other group.
 3. (C) `secrets.dir` (`root:<stack>-dev 0710`); `internal-token.env`
    (`INTERNAL_TOKEN=<64 hex>`, `root:<stack>-dev 0640`, so dev servers can call
    the API directly) — generated once, kept on re-runs. `postgres.env` stays
@@ -896,6 +903,37 @@ can't reach by design.
    `$` or quoting into `ExecStart=`. Runners removed from the config are
    disabled and deleted (list in `/etc/devstack/runners`). The request protocol
    and how results are imported belong to the project.
+9a. (C) GPU, when `gpu.enabled` and not `gpu.login_user`:
+   `/usr/local/sbin/devstack-gpu-hide` (template `system/devstack-gpu`), run by
+   `devstack-gpu.service` (oneshot, `DefaultDependencies=no`, before
+   `sysinit.target` and ssh, so before any login). For every `/dev/nvidia*`,
+   `/dev/kfd` and `/dev/dri`: bind it into `/run/devstack-gpu/<name>` (root
+   0700), **make that copy private**, then bind a mode-000 placeholder over the
+   original. Idempotent (an already-hidden name is skipped). The container user
+   can't get the nodes back: no `mknod`; in a user namespace of its own the
+   placeholder is a locked mount it can't unmount; a service's
+   `/proc/<pid>/root` needs ptrace rights over another uid. Root in the
+   container also loses the GPU; that's fine, nothing devstack runs as root
+   needs it.
+9b. (C) services (`[[container.services]]`): `zstd` if a download is
+   `.tar.zst`; per service `SERVICE_INSTALL`: curl the url as root, `sha256sum
+   -c` against the pin (a mismatch fails the phase, nothing is installed),
+   unpack as `nobody` into a scratch folder, `chown -R root:root`, `chmod -R
+   go-w`, check the command's first word is an executable inside it, swap it in
+   at `/opt/devstack/services/<name>` (with `.devstack-sha256`; the same pin
+   already there is kept). Unit `<stack>-<name>.service` from
+   `system/service.service`: `User=<stack>-<name>`, `StateDirectory=` as
+   `$HOME` (root disk: a rebuild resets it), `ProtectSystem=strict`,
+   `ProtectHome=yes`, project inaccessible, `ReadWritePaths=` only for
+   `write_paths` (which must lie in a writable `container.mounts` path), no
+   capabilities, `@system-service`, `Requires=devstack-egress.service`. Not a
+   GPU service: `PrivateDevices=yes`, `ProcSubset=pid`. A GPU service: neither
+   (the NVIDIA libraries read `/proc/driver/nvidia`), plus
+   `BindPaths=-/run/devstack-gpu/<node>:/dev/<node>` for the known node names
+   and `Requires=devstack-gpu.service`. Egress: a `meta skuid` line per service
+   to `local_only` or `local_internet`. Services removed from the config are
+   stopped and their unit and download deleted (list in
+   `/etc/devstack/services`); their user stays.
 10. (C) `/usr/local/sbin/devstack-sync` (template `system/devstack-sync`, bash,
     root 0755, outside the project) and the sudo policy (§8.1 step 8). Fixed
     subcommands, no other arguments:
@@ -904,13 +942,13 @@ can't reach by design.
     | --- | --- |
     | `packages` | reads names **from stdin** (root never opens a file the user controls), 64 KiB max, `#` comments; each must match `^[a-z0-9][a-z0-9+.-]*[a-z0-9+]$` (no trailing `-`: `apt-get install foo-` removes foo) and be an exact name in `apt-cache pkgnames` (no regex/glob fallback); installs the missing ones with `--no-install-recommends` under a `policy-rc.d` that forbids starting services, then masks every service/socket/timer/path unit shipped by a newly installed package and reports setuid/setgid files; logs to the journal (`devstack-sync`). Never removes. |
     | `check-packages` | the same validation, without root or changes |
-    | `restart app` / `restart runners` | the devstack-managed units only |
+    | `restart app` / `restart runners` / `restart services` | the devstack-managed units only |
     | `validate caddy` | validate as caddy, change nothing (root only for the CA key Caddy reads) |
     | `reload caddy` | validate as caddy, `systemctl reload caddy` |
-    | `status` | unit states, egress rules, last syncs |
+    | `status` | unit states (incl. services and `devstack-gpu`), egress rules, last syncs |
 
-    Applied only from the host by `devstack up`: runners, profiles, app data,
-    mounts, apt repos, sudo, ACL exceptions. When devstack changes the template,
+    Applied only from the host by `devstack up`: runners, services, GPU access,
+    profiles, app data, mounts, apt repos, sudo, ACL exceptions. When devstack changes the template,
     `up` reinstalls it on an existing container whose isolation phase is done
     (`refresh_sync`): the same script a fresh isolation run would install.
 
@@ -928,7 +966,11 @@ can't reach by design.
     only a warning); nothing listens on `127.0.0.1:2019`; with limited sudo, the
     login user isn't in `sudo` and `sudo -l` lists only `devstack-sync`; the app
     can write its data folder, the login user can read but not write it, the
-    runner user can't read it but can write `incoming/`.
+    runner user can't read it but can write `incoming/`. Each service user: a
+    `local` one can't reach `1.1.1.1:443` (an `internet` one only warns if it
+    can't); a service port listens on loopback only (waits up to 30 s). Hidden
+    GPU: `devstack-gpu.service` active, the login user can open none of the
+    hidden nodes, each GPU service's `/proc/<pid>/root/dev/` has them.
 
 ### 8.6 `postgres`
 
@@ -1273,6 +1315,11 @@ Each of these closes a hole found in review or testing; keep them when refactori
 | Numeric uids in `egress.nft`; `Requires=devstack-egress.service` | Loading never depends on name resolution; no rules, no service (fails closed) |
 | Not Debian's `nftables.service` | `/etc/nftables.conf` starts with `flush ruleset`, which wipes ufw's rules too |
 | Runner `command`: plain words only | `$`, `%`, quotes would be expanded or split by systemd's `ExecStart=` |
+| Service downloads root-owned under `/opt`, never in the project or a home | The login user could replace the program and run code as the service user (and with its GPU) |
+| Service archives unpacked as `nobody`, then chowned | An archive's `../` or symlink members can't write outside the scratch folder as root |
+| Service `env` values: `[A-Za-z0-9_./=:@+,-]` only | systemd expands `%` and `$` in `Environment=`, and a newline would add directives |
+| GPU copies in `/run/devstack-gpu` made private before the placeholder goes over the original | `/dev` is a shared mount: a copy left in its peer group receives the placeholder too, and GPU services lose the GPU (found on a real container) |
+| GPU hidden by moving nodes, not by owner/mode or `DeviceAllow=` | `nvidia.runtime` binds the host's own `0666` nodes, owned by an unmapped uid the container can't chown; `DeviceAllow=` needs the cgroup BPF program unprivileged containers can't attach (like `IPAddressDeny=`) |
 | The base ACL check opens its own host listener | Existing host services may already be firewalled, which hides a missing ACL |
 | Root never writes into the login user's home (dev env file written as the user) | A symlinked `~/.config/devstack` would redirect a root write anywhere |
 | The rootfs SBOM scan excludes `/home` and `/root`, and `type: "file"` components are dropped | `container.user` defaults to your **host** login name, and syft names a file component by its absolute path -- both would be published in a committed file |
@@ -1356,6 +1403,12 @@ Real-host checks for the owner after changing isolation (all passed on incus
   caddy` and the site keeps serving; a package with a service (e.g.
   `tinyproxy`) installs with the unit masked; `data backup`/`data restore`
   round-trips; `destroy` keeps the volumes unless `--purge-data`.
+- GPU (checked on incus 6.0.4, NVIDIA 580, `nvidia.runtime=true`, 2026-10-15):
+  after boot the login user gets "Insufficient Permissions" from `nvidia-smi`
+  and can't open `/dev/nvidiactl` directly, from `unshare -Urm`, or through a
+  service's `/proc/<pid>/root`; a GPU service sees the GPU; restarting
+  `devstack-gpu.service` hides nothing twice. Not yet run end to end: Ollama
+  itself (CUDA) under the service unit.
 - A runner job (a probe script as `command`, connect with
   `exec 3<>/dev/tcp/127.0.0.1/<port>`): public internet and DNS only, no
   loopback/host/LAN, no secrets in its environment or readable, can't list app
@@ -1368,7 +1421,11 @@ Real-host checks for the owner after changing isolation (all passed on incus
   whole environment incl. data in one go.
 - IPv6 pinning (needs `ipv6.dhcp.stateful` on the bridge).
 - GPU: only passthrough is provided; drivers/toolkits inside the container are
-  not installed.
+  not installed. GPU services get the known node names (`nvidiactl`,
+  `nvidia-uvm*`, `nvidia-modeset`, `nvidia-caps`, `nvidia0..15`, `kfd`, `dri`);
+  a node devstack doesn't know is hidden but not handed back (verify warns).
+  Nodes incus hot-adds after boot stay visible until `devstack-gpu.service`
+  runs again (a restart, or `up --redo isolation`).
 - Network ACL on other incus versions: on 6.0.4 the NIC-level ACL also covers
   traffic to the host itself (verified). If a version doesn't, base's verify
   step fails; the fallback would be host nftables rules on the bridge

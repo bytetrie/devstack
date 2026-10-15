@@ -1264,6 +1264,10 @@ class LoggingTests(unittest.TestCase):
 
 
 RUNNER = {"name": "fetch", "command": "node scripts/runner.ts", "port": 9101}
+SERVICE = {"name": "ollama", "url": "https://github.com/ollama/ollama/releases/download/v0.40.4/ollama-linux-amd64.tar.zst",
+           "sha256": "15f31e9576d15a481e099b4145dba6e9f8c1f295927d6b8895300ae30ed3740a", "command": "bin/ollama serve",
+           "port": 11434}
+GPU_SERVICE = {**SERVICE, "gpu": True, "env": {"OLLAMA_MODELS": "/models", "OLLAMA_NOPRUNE": "1"}}
 
 
 class IsolationConfigTests(unittest.TestCase):
@@ -1771,7 +1775,18 @@ class IsolationScriptSyntaxTests(unittest.TestCase):
         scripts = {
             "sudo": ds.bash(ds.SUDO_APPLY, USER="u", MODE="limited", DROPIN="/etc/sudoers.d/devstack-x"),
             "accounts": ds.bash(ds.ACCOUNTS, **q(STACK="s", USER="u", APP="s-app", RUNNER="s-runner", DATA="s-data",
-                                                DEV="s-dev", APP_UID=510, RUNNER_UID=511, DATA_GID=512, DEV_GID=513)),
+                                                DEV="s-dev", APP_UID=510, RUNNER_UID=511, DATA_GID=512, DEV_GID=513,
+                                                SVC_USERS=["s-ollama"], SVC_UIDS=[514])),
+            "service-install": ds.bash(ds.SERVICE_INSTALL, URL=SERVICE["url"], SHA=SERVICE["sha256"],
+                                       DIR="/opt/devstack/services/ollama", FNAME="ollama-linux-amd64.tar.zst",
+                                       Z="--zstd", ARCHIVE=True, EXE="bin/ollama"),
+            "services": ds.bash(ds.SERVICES_APPLY, NAMES=["ollama"], STACK="s", ROOT=ds.SERVICE_ROOT),
+            "services-none": ds.bash(ds.SERVICES_APPLY, NAMES=[], STACK="s", ROOT=ds.SERVICE_ROOT),
+            "gpu": ds.GPU_APPLY,
+            "service-check": ds.bash(ds.SERVICE_CHECK, USER="u", SVC_USERS=["s-ollama"], SVC_PROFILES=["local"],
+                                     SVC_PORTS=[11434], GPU_HIDDEN=True, GPU_UNITS=["s-ollama.service"],
+                                     HIDE_DIR=ds.GPU_HIDE_DIR, GPU_NODES=list(ds.GPU_NODES)),
+            "gpu-hide": ds.render("system/devstack-gpu", {"STACK": "s", "HIDE_DIR": ds.GPU_HIDE_DIR}),
             "token": ds.bash(ds.TOKEN_WRITE, DIR="/etc/app-secrets", FILE="/etc/app-secrets/t.env", GROUP="s-dev"),
             "data": ds.bash(ds.DATA_SETUP, DIR="/var/lib/s-app", APP="s-app", DATA="s-data", RUNNER="s-runner"),
             "egress": ds.EGRESS_APPLY,
@@ -2289,7 +2304,7 @@ class GpuRequirementTests(unittest.TestCase):
 
     def test_only_enabled_crosses_into_the_project(self):
         self.assertIn("gpu.enabled", ds.PROJECT_KEYS)
-        for host_only in ("gpu.pci", "gpu.nvidia_runtime"):
+        for host_only in ("gpu.pci", "gpu.nvidia_runtime", "gpu.login_user"):
             self.assertNotIn(host_only, ds.PROJECT_KEYS, host_only)
 
     def test_round_trips_and_shows_up_as_a_difference(self):
@@ -2311,6 +2326,181 @@ class GpuRequirementTests(unittest.TestCase):
             with self.assertRaises(ds.ConfigError) as cm:
                 ds.load_requirements(path)
         self.assertIn("gpu.pci", str(cm.exception))
+
+
+class ServiceTests(unittest.TestCase):
+    """container.services: a pinned download run as its own user, and the GPU kept for GPU services."""
+
+    MOUNT = {"name": "models", "source": "/srv/m", "path": "/models", "readonly": True}
+
+    def cfg(self, *services, **overrides):
+        return make_config(**{"container.services": list(services), **overrides})
+
+    def ctx(self, d, *services, **overrides):
+        return make_ctx(Path(d), FakeRunner(), **{"container.services": list(services), **overrides})
+
+    def test_defaults_are_filled_in(self):
+        self.assertEqual(self.cfg(SERVICE)["container.services"],
+                         [{**SERVICE, "profile": "local", "gpu": False, "env": {}, "write_paths": [], "memory_max": ""}])
+        self.assertNotIn("port", self.cfg({k: x for k, x in SERVICE.items() if k != "port"})["container.services"][0])
+
+    def test_bad_services_rejected(self):
+        rw = {"container.mounts": [{**self.MOUNT, "readonly": False}]}
+        bad = [
+            ({**SERVICE, "name": "Ollama"}, {}),
+            ({**SERVICE, "name": "app"}, {}),  # devbox-app is the app's user
+            ({**SERVICE, "name": "fetch"}, {"app.runners": [RUNNER]}),  # a runner's name
+            ({**SERVICE, "url": "http://example.com/ollama.tar.zst"}, {}),
+            ({**SERVICE, "url": "https://example.com/o llama"}, {}),
+            ({**SERVICE, "sha256": "abc"}, {}),
+            ({**SERVICE, "sha256": SERVICE["sha256"].upper()}, {}),
+            ({**SERVICE, "command": "/usr/bin/ollama serve"}, {}),  # outside the download
+            ({**SERVICE, "command": "../bin/ollama serve"}, {}),
+            ({**SERVICE, "command": "bin/ollama $HOME"}, {}),
+            ({**SERVICE, "url": "https://example.com/tool", "command": "other"}, {}),  # single file: its own name
+            ({**SERVICE, "port": 8080}, {}),  # app.port
+            ({**SERVICE, "port": 9101}, {"app.runners": [RUNNER]}),
+            ({**SERVICE, "port": 443}, {}),
+            ({**SERVICE, "profile": "open"}, {}),
+            ({**SERVICE, "gpu": True}, {}),  # gpu.enabled is off
+            ({**SERVICE, "env": {"lower": "x"}}, {}),
+            ({**SERVICE, "env": {"HOME": "/root"}}, {}),
+            ({**SERVICE, "env": {"X": "a b"}}, {}),
+            ({**SERVICE, "env": {"X": "%h"}}, {}),
+            ({**SERVICE, "env": {"X": "$PATH"}}, {}),
+            ({**SERVICE, "write_paths": ["/etc"]}, rw),
+            ({**SERVICE, "write_paths": ["/models/../etc"]}, rw),
+            ({**SERVICE, "write_paths": ["/models"]}, {"container.mounts": [self.MOUNT]}),  # read-only mount
+            ({**SERVICE, "memory_max": "lots"}, {}),
+            ({k: x for k, x in SERVICE.items() if k != "sha256"}, {}),
+        ]
+        for s, extra in bad:
+            with self.assertRaises(ds.ConfigError, msg=s):
+                self.cfg(s, **extra)
+        with self.assertRaises(ds.ConfigError):
+            self.cfg(SERVICE, {**SERVICE, "port": 11435})  # same name
+        with self.assertRaises(ds.ConfigError):
+            self.cfg(SERVICE, {**SERVICE, "name": "other"})  # same port
+        with self.assertRaises(ds.ConfigError):
+            self.cfg(SERVICE, **{"firewall.allow": [22, 80, 443, 11434]})
+        with self.assertRaises(ds.ConfigError):
+            self.cfg(SERVICE, **{"caddy.dev_servers": {"x": "11434"}})
+
+    def test_good_services_accepted(self):
+        self.cfg(GPU_SERVICE, **{"gpu.enabled": True})
+        self.cfg({**SERVICE, "url": "https://example.com/dl/tool?x=1", "command": "tool --flag=1"})
+        self.cfg({**SERVICE, "write_paths": ["/models/cache"]}, **{"container.mounts": [{**self.MOUNT, "readonly": False}]})
+
+    def test_service_ids_follow_the_isolation_ids_and_avoid_postgres(self):
+        cfg = self.cfg(SERVICE, {**SERVICE, "name": "other", "port": 11435})
+        self.assertEqual([uid for _, uid in ds.service_uids(cfg)], [514, 515])
+        self.assertEqual(ds.service_user(cfg, SERVICE), "devbox-ollama")
+        with self.assertRaises(ds.ConfigError):
+            self.cfg(SERVICE, **{"isolation.system_uid_base": 496})  # 496-500 reaches postgres 500
+
+    def test_download_kinds(self):
+        self.assertEqual(ds.service_download(SERVICE["url"]), ("ollama-linux-amd64.tar.zst", "--zstd"))
+        self.assertEqual(ds.service_download("https://x/a.tgz"), ("a.tgz", "--gzip"))
+        self.assertEqual(ds.service_download("https://x/a.tar?sig=1#f"), ("a.tar", ""))
+        self.assertEqual(ds.service_download("https://x/bin/tool?sig=1"), ("tool", None))
+
+    def test_toml_and_requirements_roundtrip(self):
+        import tomllib
+        values = {**ds.defaults(), "gpu.enabled": True, "container.services": [GPU_SERVICE]}
+        data = tomllib.loads(ds.config_to_toml(values))
+        self.assertEqual(data["container"]["services"], [GPU_SERVICE])
+        self.assertIn("# [[container.services]]", ds.config_to_toml(ds.defaults()))
+        cfg = ds.Config(values, None)
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "devstack-requires.toml"
+            path.write_text(ds.requirements_to_toml(ds.requirements(cfg.v)))
+            want = ds.load_requirements(path)
+        self.assertEqual(want["container.services"], cfg["container.services"])
+        _missing, diffs = ds.requirements_diff(want, ds.resolve(ds.defaults()))
+        self.assertTrue([x for x in diffs if x.startswith("container.services:")], diffs)
+
+    def test_egress_and_firewall(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = self.ctx(d, SERVICE, {**SERVICE, "name": "fetcher", "port": 11435, "profile": "internet"}).cfg
+            nft = ds.egress_nft(c, ["127.0.0.53"])
+            self.assertIn("meta skuid 514 jump local_only  # devbox-ollama", nft)
+            self.assertIn("meta skuid 515 jump local_internet  # devbox-fetcher", nft)
+            self.assertIn(11434, ds.IsolationPhase().deny_ports(c))
+
+    def test_units(self):
+        with tempfile.TemporaryDirectory() as d:
+            ctx = self.ctx(d, GPU_SERVICE, {**SERVICE, "name": "plain", "port": 11435}, **{"gpu.enabled": True})
+            units = ds.service_units(ctx.cfg, ctx.tvars())
+            gpu, plain = units["/etc/systemd/system/devbox-ollama.service"], units["/etc/systemd/system/devbox-plain.service"]
+            for text in units.values():
+                self.assertNotIn("@@", text)
+                self.assertIn("Requires=devstack-egress.service", text)
+                self.assertIn("InaccessiblePaths=-/srv/devbox\n", text)
+                self.assertIn("NoNewPrivileges=yes", text)
+                self.assertNotRegex(text, r"(?m)^(EnvironmentFile|SupplementaryGroups|DynamicUser)=")
+            self.assertIn("ExecStart=/opt/devstack/services/ollama/bin/ollama serve\n", gpu)
+            self.assertIn("User=devbox-ollama\n", gpu)
+            self.assertIn("Environment=OLLAMA_MODELS=/models\n", gpu)
+            self.assertIn("BindPaths=-/run/devstack-gpu/nvidiactl:/dev/nvidiactl\n", gpu)
+            self.assertIn("Requires=devstack-egress.service devstack-gpu.service", gpu)
+            self.assertNotRegex(gpu, r"(?m)^(PrivateDevices|ProcSubset)=")
+            self.assertIn("PrivateDevices=yes", plain)
+            self.assertNotIn("BindPaths", plain)
+            self.assertNotIn("devstack-gpu.service", plain)
+            open_gpu = self.ctx(d, GPU_SERVICE, **{"gpu.enabled": True, "gpu.login_user": True})
+            text = ds.service_units(open_gpu.cfg, open_gpu.tvars())["/etc/systemd/system/devbox-ollama.service"]
+            self.assertNotIn("BindPaths", text)
+            self.assertNotIn("devstack-gpu.service", text)
+
+    def test_gpu_hidden_by_default(self):
+        self.assertFalse(ds.gpu_hidden(make_config()))
+        self.assertTrue(ds.gpu_hidden(make_config(**{"gpu.enabled": True})))
+        self.assertFalse(ds.gpu_hidden(make_config(**{"gpu.enabled": True, "gpu.login_user": True})))
+        script = ds.render("system/devstack-gpu", {"STACK": "devbox", "HIDE_DIR": ds.GPU_HIDE_DIR})
+        self.assertIn("hide=/run/devstack-gpu", script)
+        self.assertIn('mount --bind "$none_file" "$p"', script)
+
+    def test_new_or_changed_service_is_a_risk_until_applied(self):
+        with tempfile.TemporaryDirectory() as d:
+            ctx = self.ctx(d, SERVICE)
+            rep = ds.Report()
+            ds.preflight_isolation(ctx, rep, set())
+            self.assertTrue(any(SERVICE["sha256"] in r for r in rep.risks), rep.risks)
+            ctx.state.set_fact("services", ctx.cfg["container.services"])
+            rep = ds.Report()
+            ds.preflight_isolation(ctx, rep, set())
+            self.assertEqual(rep.risks, [])
+            ctx2 = self.ctx(d, {**SERVICE, "sha256": "0" * 64})
+            rep = ds.Report()
+            ds.preflight_isolation(ctx2, rep, set())
+            self.assertTrue(any("0" * 64 in r for r in rep.risks), rep.risks)
+
+    def test_changes_after_isolation_point_at_redo(self):
+        with tempfile.TemporaryDirectory() as d:
+            ctx = self.ctx(d, **{"gpu.enabled": True})
+            ctx.state.set_status("isolation", "done")  # an older isolation: GPU not hidden yet
+            rep = ds.Report()
+            ds.preflight_isolation(ctx, rep, set())
+            self.assertTrue(any("--redo isolation" in w for w in rep.warnings), rep.warnings)
+            ctx.state.set_fact("gpu_hidden", True)
+            rep = ds.Report()
+            ds.preflight_isolation(ctx, rep, set())
+            self.assertFalse(any("--redo isolation" in w for w in rep.warnings), rep.warnings)
+            rep = ds.Report()
+            ds.preflight_isolation(self.ctx(d, **{"gpu.enabled": True, "gpu.login_user": True}), rep, set())
+            self.assertTrue(any("gpu.login_user = true" in w for w in rep.warnings), rep.warnings)
+
+    def test_devstack_sync_restarts_services(self):
+        cfg = make_config(**{"container.services": [GPU_SERVICE], "gpu.enabled": True})
+        text = ds.devstack_sync_script(cfg)
+        self.assertIn("service_units=(devbox-ollama.service)", text)
+        self.assertIn("gpu_unit=devstack-gpu.service", text)
+        self.assertIn("app | runners | services) cmd_restart", text)
+        self.assertIn("gpu_unit=''", ds.devstack_sync_script(make_config()))
+        with tempfile.TemporaryDirectory() as d:
+            script = Path(d) / "devstack-sync"
+            script.write_text(text)
+            self.assertEqual(subprocess.run(["bash", "-n", script]).returncode, 0)
 
 
 class SbomConfigTests(unittest.TestCase):

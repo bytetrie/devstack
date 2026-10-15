@@ -21,6 +21,11 @@ services it edits stay inside OS-enforced limits:
 - The app and runner jobs run as fixed system users with nftables egress
   profiles: by default the app reaches loopback only (no DNS), runners reach the
   public internet only (no loopback, no private ranges) and get no secrets.
+  `container.services` each run a root-owned, sha256-pinned download as their
+  own user, loopback only by default.
+- A passed-through GPU is hidden from the login user, the app and runners
+  (`gpu.login_user = false`, the default); only services with `gpu = true` get
+  the device nodes.
 - Caddy's admin API is a unix socket only caddy and root can use, and its global
   options are root-owned, so a project Caddyfile can't turn it back on.
 
@@ -69,7 +74,9 @@ on the host. See the "Security and trust" section of `index.html`.
 Known and accepted: the login user (every agent) can read and write the real
 database as the app role, read the app data and use the internet, so it can send
 that data out; an app that can hand a runner arbitrary URLs can reach the
-internet through it; and a project-owned Caddyfile can serve anything the caddy
+internet through it; anything in the container can call a service's loopback
+API (an Ollama API can create models from uploaded files, so a parser bug there
+runs code as that service, with its GPU); and a project-owned Caddyfile can serve anything the caddy
 user can read, including the intermediate CA key (limited to the dev domain by
 the root's name constraint).
 
@@ -78,8 +85,9 @@ the root's name constraint).
 Bugs that let container code reach the host beyond the channels above, make the
 host trust more than the dev domain, run attacker-controlled shell through
 config values, or make undo modify files it does not own. Also: ways for the
-login user to become root without `incus exec`, or for the app or a runner to get
-past its egress profile or file permissions.
+login user to become root without `incus exec`, for the app, a runner or a
+service to get past its egress profile or file permissions, or for anything but
+a GPU service to open a hidden GPU.
 
 ## Out of scope
 

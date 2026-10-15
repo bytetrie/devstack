@@ -147,6 +147,25 @@ memory_limit = ""
 # path = "/srv/data"
 # readonly = false
 
+# Long-running services from a pinned download, e.g. a local model server. Each entry:
+# name, url (https), sha256 (of the download, checked before use), command (its first
+# word a path inside the download, e.g. 'bin/ollama serve'), and optionally port
+# (127.0.0.1 only), profile ('local': loopback only, the default; 'internet'), gpu
+# (default false; needs gpu.enabled), env (a table of environment variables),
+# write_paths (container.mounts paths it may write; everything else is read-only) and
+# memory_max. Each runs as its own system user, <stack.name>-<name>, under a hardened
+# unit and an egress profile; the download is installed root-owned under
+# /opt/devstack/services, so nothing the container user can edit runs as the service. A
+# new or changed service needs your OK.
+# [[container.services]]
+# name = "ollama"
+# url = "https://github.com/ollama/ollama/releases/download/v<version>/ollama-linux-amd64.tar.zst"
+# sha256 = "<64 hex digits, from the release's sha256sum.txt>"
+# command = "bin/ollama serve"
+# port = 11434
+# gpu = true
+# env = { OLLAMA_HOST = "127.0.0.1:11434", OLLAMA_MODELS = "/models", OLLAMA_NOPRUNE = "1", OLLAMA_NO_CLOUD = "1" }
+
 # The incus network ACL that keeps the whole container off the host and the LAN.
 # Enforced on the host, so nothing inside the container (not even root) can change it.
 [network]
@@ -179,6 +198,14 @@ pci = ""
 # nvidia-container-toolkit on the host).
 # default: true
 nvidia_runtime = true
+
+# Whether the container user (and every agent running as it) may open the GPU devices.
+# false: at boot devstack-gpu.service hides the GPU device nodes from everything in the
+# container, and only container.services entries with gpu = true get them back, so code
+# you or an agent runs can't reach the GPU driver, which runs in the host's kernel.
+# true: anyone in the container can use the GPU.
+# default: false
+login_user = false
 
 # incus snapshots taken before each phase; they are what makes container changes
 # undoable.
@@ -472,8 +499,9 @@ deny = []
 # changes.
 [isolation]
 # First of four fixed ids: app uid = base, runner uid/gid = base+1, data gid = base+2,
-# dev gid = base+3. Mid-range on purpose, like postgres.system_uid: Debian hands out
-# system ids downward from 999.
+# dev gid = base+3; then one uid/gid per container.services entry, in order, from
+# base+4. Mid-range on purpose, like postgres.system_uid: Debian hands out system ids
+# downward from 999.
 # default: 510
 system_uid_base = 510
 

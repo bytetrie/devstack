@@ -46,6 +46,15 @@ blocked by an incus ACL on the host, not by anything in here.
     `shell: true`. Create it there if you need it.
   - `eslint-disable` only for one rule, on one line, with `-- reason`; never edit `eslint.config.js`
     or `tsconfig.json` to loosen a rule without flagging it.
+- **Tools that aren't Debian packages**: don't install them into your home or the project, and never
+  `curl | sh`. A long-running one (a model server, say) is a service the host adds: an entry in
+  `[[container.services]]` with its download's sha256, applied with `./devstack up --redo isolation`.
+  Ask for it, naming the release URL; the host owner pins the checksum. Services declared for this
+  project are in `infra/devstack-requires.toml`; call them on their loopback port, and restart them
+  with `sudo devstack-sync restart services`.
+- **GPU**: you can't open it, even if the machine has one (`nvidia-smi` says "Insufficient
+  Permissions"). Only services with `gpu = true` can. Work that needs the GPU goes through such a
+  service's API; don't look for a way around it.
 - **Calling the app**: use `https://@@DEV_HOST@@`, not `127.0.0.1:@@APP_PORT@@`. Without Caddy's
   internal token the app answers every request with a bare 500. Login shells get the dev CA through
   `NODE_EXTRA_CA_CERTS`; set it yourself for a process started another way.

@@ -452,6 +452,16 @@ SCHEMA: list[Field] = [
           "Extra host folders to mount, e.g. a shared data folder. Each entry: name, source "
           "(host path), path (container path), readonly (default false), shift (default true). "
           "Entries added after the container exists are added by the next `up`."),
+    Field("container.services", "services", [],
+          "Long-running services from a pinned download, e.g. a local model server. Each entry: name, url "
+          "(https), sha256 (of the download, checked before use), command (its first word a path inside "
+          "the download, e.g. 'bin/ollama serve'), and optionally port (127.0.0.1 only), profile ('local': "
+          "loopback only, the default; 'internet'), gpu (default false; needs gpu.enabled), env (a table of "
+          "environment variables), write_paths (container.mounts paths it may write; everything else is "
+          "read-only) and memory_max. Each runs as its own system user, <stack.name>-<name>, under a "
+          "hardened unit and an egress profile; the download is installed root-owned under "
+          "/opt/devstack/services, so nothing the container user can edit runs as the service. A new or "
+          "changed service needs your OK."),
     # network
     Field("network.acl", "bool", True,
           "Attach an incus network ACL to the container's NIC that rejects traffic to the host (except DNS and "
@@ -467,6 +477,12 @@ SCHEMA: list[Field] = [
     Field("gpu.nvidia_runtime", "bool", True,
           "Set nvidia.runtime=true so the host's NVIDIA userspace libs are injected "
           "(requires nvidia-container-toolkit on the host)."),
+    Field("gpu.login_user", "bool", False,
+          "Whether the container user (and every agent running as it) may open the GPU devices. false: "
+          "at boot devstack-gpu.service hides the GPU device nodes from everything in the container, and "
+          "only container.services entries with gpu = true get them back, so code you or an agent runs "
+          "can't reach the GPU driver, which runs in the host's kernel. true: anyone in the container can "
+          "use the GPU."),
     # snapshots
     Field("snapshots.mode", "str", "per-phase",
           "'per-phase': snapshot before every phase after 'base' so it can be undone. "
@@ -620,7 +636,8 @@ SCHEMA: list[Field] = [
           "Extra TCP ports denied (app.port, postgres.port and runner ports are always denied).", check=_ports),
     # isolation
     Field("isolation.system_uid_base", "int", 510,
-          "First of four fixed ids: app uid = base, runner uid/gid = base+1, data gid = base+2, dev gid = base+3. "
+          "First of four fixed ids: app uid = base, runner uid/gid = base+1, data gid = base+2, dev gid = base+3; "
+          "then one uid/gid per container.services entry, in order, from base+4. "
           "Mid-range on purpose, like postgres.system_uid: Debian hands out system ids downward from 999.",
           check=lambda v: None if 100 <= v <= 990 else "must be a system id (100-990)"),
     Field("isolation.app_user", "str", "{stack.name}-app", "System user the app runs as.",
@@ -729,6 +746,9 @@ MOUNT_KEYS = {"name": str, "source": str, "path": str, "readonly": bool, "shift"
 RUNNER_KEYS = {"name": str, "command": str, "port": int, "memory_max": str, "runtime_max": str,
                "max_connections": int}
 RUNNER_DEFAULTS = {"memory_max": "1G", "runtime_max": "1h", "max_connections": 4}
+SERVICE_KEYS = {"name": str, "url": str, "sha256": str, "command": str, "port": int, "profile": str, "gpu": bool,
+                "env": dict, "write_paths": list, "memory_max": str}
+SERVICE_DEFAULTS = {"profile": "local", "gpu": False, "env": {}, "write_paths": [], "memory_max": ""}
 RESERVED_DEVICES = {"project", "git", "pgdata", "appdata", "gpu"}
 RO_DEVICE = re.compile(r"ro[0-9]+|ro-[0-9a-f]{12}")  # project.readonly_paths devices (ro<N>: older devstack)
 PLACEHOLDER = re.compile(r"\{([a-z_]+)\.([a-z_]+)\}")
@@ -818,12 +838,37 @@ def type_check(f: Field, v: Any) -> str | None:
                 if k not in r:
                     return f"entry {i}: missing '{k}'"
         return None
+    if f.kind == "services":
+        if not isinstance(v, list):
+            return "must be an array of tables ([[container.services]])"
+        for i, s in enumerate(v):
+            if not isinstance(s, dict):
+                return f"entry {i} must be a table"
+            for k, x in s.items():
+                if k not in SERVICE_KEYS:
+                    return f"entry {i}: unknown key '{k}' (allowed: {', '.join(SERVICE_KEYS)})"
+                if not isinstance(x, SERVICE_KEYS[k]) or (isinstance(x, bool) and SERVICE_KEYS[k] is not bool):
+                    return f"entry {i}: '{k}' has the wrong type"
+            if not all(isinstance(k, str) and isinstance(x, str) for k, x in s.get("env", {}).items()):
+                return f"entry {i}: 'env' must be a table of strings"
+            if not all(isinstance(x, str) for x in s.get("write_paths", [])):
+                return f"entry {i}: 'write_paths' must be a list of strings"
+            for k in ("name", "url", "sha256", "command"):
+                if k not in s:
+                    return f"entry {i}: missing '{k}'"
+        return None
     raise AssertionError(f.kind)
 
 
 def normalize_runners(v: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Runner entries with every optional key filled in, in a fixed key order (so they compare equal)."""
     return [{k: x[k] for k in RUNNER_KEYS if k in x} for x in ({**RUNNER_DEFAULTS, **r} for r in v)]
+
+
+def normalize_services(v: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Service entries with every optional key filled in (port stays absent when not given), in a fixed
+    key order, so they compare equal."""
+    return [{k: x[k] for k in SERVICE_KEYS if k in x} for x in ({**SERVICE_DEFAULTS, **s} for s in v)]
 
 
 def parse_toml(path: Path) -> dict[str, Any]:
@@ -904,6 +949,7 @@ def resolve(values: dict[str, Any]) -> dict[str, Any]:
         {**m, "source": str(Path(m["source"]).expanduser())} for m in out["container.mounts"]
     ]
     out["app.runners"] = normalize_runners(out["app.runners"])
+    out["container.services"] = normalize_services(out["container.services"])
     return out
 
 
@@ -920,7 +966,8 @@ def validate(v: dict[str, Any]) -> list[str]:
         if f.path and val and not val.startswith("/"):
             errors.append(f"{f.key} = {val!r}: must be an absolute path (after ~ expansion)")
     taken = {v["app.port"]: "app.port", v["postgres.port"]: "postgres.port",
-             **{r["port"]: f"runner {r['name']}" for r in v["app.runners"] if isinstance(r, dict) and "port" in r}}
+             **{r["port"]: f"runner {r['name']}" for r in v["app.runners"] if isinstance(r, dict) and "port" in r},
+             **{s["port"]: f"service {s.get('name')}" for s in v["container.services"] if "port" in s}}
     for name, port in v["caddy.dev_servers"].items():
         if str(port).isdigit() and int(port) in taken:
             errors.append(f"caddy.dev_servers: {name} = {port} is {taken[int(port)]}'s port")
@@ -957,12 +1004,17 @@ def validate(v: dict[str, Any]) -> list[str]:
     if len(set(accounts)) != len(accounts):
         errors.append("isolation: app_user, runner_user, data_group and dev_group must all differ")
     base = v["isolation.system_uid_base"]
-    if base <= v["postgres.system_uid"] <= base + 3:
+    last = base + 3 + len(v["container.services"])
+    if base <= v["postgres.system_uid"] <= last:
         errors.append(f"isolation.system_uid_base {base} overlaps postgres.system_uid {v['postgres.system_uid']} "
-                      f"(the isolation ids are {base}-{base + 3})")
+                      f"(the isolation ids are {base}-{last})")
+    if last > 999:
+        errors.append(f"isolation ids run to {last} with {len(v['container.services'])} service(s): lower "
+                      "isolation.system_uid_base (system ids end at 999)")
     if v["postgres.test_db"] and v["postgres.test_db"] == v["postgres.db"]:
         errors.append("postgres.test_db must differ from postgres.db (tests wipe it)")
     errors += validate_runners(v)
+    errors += validate_services(v)
     return errors
 
 
@@ -1010,6 +1062,97 @@ def validate_runners(v: dict[str, Any]) -> list[str]:
             errors.append(f"{label}: max_connections must be 1-64")
     if runners and set(seen_ports) & set(v["firewall.allow"]):
         errors.append("firewall.allow must not contain a runner port (runners stay internal)")
+    return errors
+
+
+SERVICE_URL_RX = r"https://[A-Za-z0-9._~:/?#\[\]@!&()*+,;=%-]+"
+SERVICE_ARCHIVES = {".tar.gz": "--gzip", ".tgz": "--gzip", ".tar.xz": "--xz", ".tar.zst": "--zstd", ".tar": ""}
+SERVICE_ENV_KEY_RX = r"[A-Z_][A-Z0-9_]{0,63}"
+# Nothing systemd's Environment= would split, quote or expand ($, %), and no newlines.
+SERVICE_ENV_VALUE_RX = r"[A-Za-z0-9_./=:@+,-]*"
+SERVICE_RESERVED_NAMES = {"app", "runner", "data", "dev", "egress", "gpu", "sync"}
+
+
+def service_download(url: str) -> tuple[str, str | None]:
+    """(file name, tar compression flag) of a service URL; None = not an archive, a single binary."""
+    name = PurePosixPath(re.split(r"[?#]", url, maxsplit=1)[0]).name
+    for ext, flag in SERVICE_ARCHIVES.items():
+        if name.endswith(ext):
+            return name, flag
+    return name, None
+
+
+def validate_services(v: dict[str, Any]) -> list[str]:
+    errors = []
+    reserved = {v["app.port"]: "app.port", 22: "ssh", 80: "Caddy", 443: "Caddy", 2019: "Caddy's default admin port",
+                **{r["port"]: f"runner {r.get('name')}" for r in v["app.runners"] if "port" in r}}
+    if v["postgres.enabled"]:
+        reserved[v["postgres.port"]] = "postgres.port"
+    accounts = {v[k] for k in ("isolation.app_user", "isolation.runner_user", "isolation.data_group",
+                               "isolation.dev_group")} | {v["app.service_name"]}
+    runner_names = {r.get("name") for r in v["app.runners"]}
+    writable = [m["path"] for m in v["container.mounts"] if not m.get("readonly")]
+    seen_names: set[str] = set()
+    seen_ports: set[int] = set()
+    for s in v["container.services"]:
+        missing = [k for k in ("name", "url", "sha256", "command") if k not in s]
+        if missing:
+            errors.append(f"container.services: an entry is missing {', '.join(missing)}")
+            continue
+        label = f"container.services '{s['name']}'"
+        if not re.fullmatch(RUNNER_NAME_RX, s["name"]):
+            errors.append(f"{label}: name must be 1-20 chars: a-z, 0-9, '-', starting with a letter")
+        user = f"{v['stack.name']}-{s['name']}"
+        if s["name"] in seen_names or s["name"] in runner_names:
+            errors.append(f"{label}: duplicate name (services and runners need distinct names)")
+        elif s["name"] in SERVICE_RESERVED_NAMES or user in accounts:
+            errors.append(f"{label}: the name is taken by devstack's own units or users")
+        if len(user) > 32:
+            errors.append(f"{label}: its user name {user!r} is longer than 32 characters")
+        seen_names.add(s["name"])
+        if not re.fullmatch(SERVICE_URL_RX, s["url"]):
+            errors.append(f"{label}: url must be an https:// URL")
+        if not re.fullmatch(r"[0-9a-f]{64}", s["sha256"]):
+            errors.append(f"{label}: sha256 must be 64 lowercase hex digits (the download's checksum)")
+        if not re.fullmatch(RUNNER_COMMAND_RX, s["command"]):
+            errors.append(f"{label}: command must be words of [A-Za-z0-9_./=:@+-] separated by single spaces "
+                          "(no quotes, $ or %)")
+        else:
+            exe = s["command"].split()[0]
+            parts = exe.split("/")
+            fname, archive = service_download(s["url"])
+            if exe.startswith(("/", "-")) or any(p in ("", ".", "..") for p in parts):
+                errors.append(f"{label}: the command's first word must be a relative path inside the download, "
+                              f"e.g. 'bin/{s['name']}'")
+            elif archive is None and exe != fname:
+                errors.append(f"{label}: the url is a single file, so the command must start with its name, {fname!r}")
+        if "port" in s:
+            if _port(s["port"]):
+                errors.append(f"{label}: port must be 1-65535")
+            elif s["port"] in reserved:
+                errors.append(f"{label}: port {s['port']} is already {reserved[s['port']]}")
+            elif s["port"] in seen_ports:
+                errors.append(f"{label}: port {s['port']} is used by another service")
+            elif s["port"] in v["firewall.allow"]:
+                errors.append(f"{label}: port {s['port']} is in firewall.allow (services stay internal)")
+            seen_ports.add(s["port"])
+        if s["profile"] not in ("local", "internet"):
+            errors.append(f"{label}: profile must be 'local' or 'internet'")
+        if s["gpu"] and not v["gpu.enabled"]:
+            errors.append(f"{label}: gpu = true needs gpu.enabled = true")
+        for k, x in s["env"].items():
+            if not re.fullmatch(SERVICE_ENV_KEY_RX, k) or k == "HOME":
+                errors.append(f"{label}: env key {k!r} must be UPPER_SNAKE_CASE (and not HOME, which is the "
+                              "service's state folder)")
+            if not re.fullmatch(SERVICE_ENV_VALUE_RX, x):
+                errors.append(f"{label}: env {k} = {x!r} may only use [A-Za-z0-9_./=:@+,-] (no spaces, quotes, $ or %)")
+        for p in s["write_paths"]:
+            pp = PurePosixPath(p)
+            if not p.startswith("/") or ".." in pp.parts or not any(pp.is_relative_to(w) for w in writable):
+                errors.append(f"{label}: write_paths {p!r} must be inside a container.mounts path that isn't "
+                              "read-only")
+        if s["memory_max"] and not re.fullmatch(MEMORY_RX, s["memory_max"]):
+            errors.append(f"{label}: memory_max must look like '512M', '8G' or '50%'")
     return errors
 
 
@@ -1082,11 +1225,18 @@ def field_comment(f: Field) -> list[str]:
     return lines
 
 
-TABLE_KINDS = ("strmap", "mounts", "runners")
+TABLE_KINDS = ("strmap", "mounts", "runners", "services")
+LIST_TABLE_KINDS = ("runners", "services")  # arrays of tables a project may require (REQUIRES_FILE)
 EXAMPLE_TABLES = {
     "mounts": ['name = "data"', 'source = "~/data"', 'path = "/srv/data"', "readonly = false"],
     "runners": ['name = "fetch"', 'command = "node scripts/runner.ts"', "port = 9101", 'memory_max = "2G"',
                 'runtime_max = "2h"', "max_connections = 2"],
+    "services": ['name = "ollama"',
+                 'url = "https://github.com/ollama/ollama/releases/download/v<version>/ollama-linux-amd64.tar.zst"',
+                 'sha256 = "<64 hex digits, from the release\'s sha256sum.txt>"', 'command = "bin/ollama serve"',
+                 "port = 11434", "gpu = true",
+                 'env = { OLLAMA_HOST = "127.0.0.1:11434", OLLAMA_MODELS = "/models", OLLAMA_NOPRUNE = "1", '
+                 'OLLAMA_NO_CLOUD = "1" }'],
 }
 
 
@@ -1140,12 +1290,14 @@ REQUIRES_FILE = "infra/devstack-requires.toml"
 # anything on the host. Mounts are listed without their host source.
 # Host details (LAN CIDRs, the Caddy admin address, volume names, host folders) stay out: a
 # public repo must neither learn them nor be able to, say, put Caddy's admin API back on TCP.
-# Requests that widen access (container.sudo, app.profile, app.runners, gpu.enabled) still need
-# the developer's OK: a file that differs from what this stack last wrote is a preflight risk.
+# Requests that widen access (container.sudo, app.profile, app.runners, container.services,
+# gpu.enabled) still need the developer's OK: a file that differs from what this stack last wrote
+# is a preflight risk.
 # Of the [gpu] keys only gpu.enabled is here -- whether the code needs a GPU at all is the
 # project's to state, and leaving it out meant a rebuild elsewhere (or from a fresh `init`)
 # silently came up without one. gpu.pci names a device on one host and gpu.nvidia_runtime
-# depends on that host's toolkit, so both stay host-side.
+# depends on that host's toolkit, so both stay host-side. gpu.login_user stays host-side too: a
+# cloned repo must not be able to hand the GPU back to every agent in the container.
 # Of the [sbom] keys only the two the project legitimately decides are here. sbom.fail_on and
 # sbom.ignore are the host owner's audit policy: a cloned repo must not be able to lower the gate or
 # silence a CVE. sbom.enabled stays out so a repo cannot add a GitHub download to someone's base
@@ -1158,6 +1310,7 @@ PROJECT_KEYS = (
     "caddy.same_origin", "caddy.max_request_body", "caddy.dev_servers",
     "checkpoint.derived", "checkpoint.restore_command",
     "app.service_name", "app.bind", "app.port", "app.entry", "app.profile", "app.data", "app.runners",
+    "container.services",
     "firewall.enabled", "firewall.allow", "firewall.deny", "secrets.dir", "secrets.token_file",
     "gpu.enabled",
     "postgres.enabled", "postgres.version", "postgres.port", "postgres.system_uid",
@@ -1191,14 +1344,14 @@ def requirements_to_toml(req: dict[str, Any]) -> str:
             continue
         out += ["", f"[{section}]"]
         for f in fields:
-            if f.kind in TABLE_KINDS and not (f.kind == "runners" and not req[f.key]):
+            if f.kind in TABLE_KINDS and not (f.kind in LIST_TABLE_KINDS and not req[f.key]):
                 continue
             out += comment(f.help)
-            out.append(f"{f.name} = {toml_value(req[f.key])}")  # no runners: `runners = []`, stated explicitly
+            out.append(f"{f.name} = {toml_value(req[f.key])}")  # none: `runners = []`, stated explicitly
         for f in (f for f in fields if f.kind == "strmap"):
             out += ["", *comment(f.help), f"[{f.key}]"]
             out += [f"{toml_key(k)} = {toml_value(x)}" for k, x in req[f.key].items()]
-        for f in (f for f in fields if f.kind == "runners" and req[f.key]):
+        for f in (f for f in fields if f.kind in LIST_TABLE_KINDS and req[f.key]):
             out += ["", *comment(f.help), *array_of_tables(f.key, req[f.key], f.kind)]
     out += [""]
     mounts = req.get("container.mounts", [])
@@ -1481,6 +1634,8 @@ def load_requirements(path: Path) -> dict[str, Any] | None:
                 errors.append(f"{full}: {{placeholders}} are not allowed here, write the value itself")
             elif full == "app.runners":
                 values[full] = normalize_runners(v)
+            elif full == "container.services":
+                values[full] = normalize_services(v)
             else:
                 values[full] = v
     if errors:
@@ -2057,6 +2212,29 @@ def isolation_ids(c: Config) -> dict[str, int]:
 def runner_unit(c: Config, r: dict[str, Any]) -> str:
     """Unit base name of a runner: <unit>.socket + <unit>@.service."""
     return f"{c['stack.name']}-{r['name']}"
+
+
+SERVICE_ROOT = "/opt/devstack/services"  # one root-owned folder per service: <name>/
+GPU_HIDE_DIR = "/run/devstack-gpu"
+GPU_HIDE_PATH = "/usr/local/sbin/devstack-gpu-hide"
+# Nodes a GPU service gets back (BindPaths=, each optional). The NVIDIA set plus AMD's kfd and dri/.
+GPU_NODES = ("nvidiactl", "nvidia-uvm", "nvidia-uvm-tools", "nvidia-modeset", "nvidia-caps",
+             *(f"nvidia{i}" for i in range(16)), "kfd", "dri")
+
+
+def service_user(c: Config, s: dict[str, Any]) -> str:
+    """System user and unit name (<user>.service) of a container.services entry."""
+    return f"{c['stack.name']}-{s['name']}"
+
+
+def service_uids(c: Config) -> list[tuple[dict[str, Any], int]]:
+    base = c["isolation.system_uid_base"] + 4
+    return [(s, base + i) for i, s in enumerate(c["container.services"])]
+
+
+def gpu_hidden(c: Config) -> bool:
+    """Whether devstack-gpu.service hides the GPU nodes from everything but GPU services."""
+    return c["gpu.enabled"] and not c["gpu.login_user"]
 
 
 def remove_block(text: str, begin: str, end: str) -> str:
@@ -4076,6 +4254,12 @@ ensure_user "$app" "$app_uid" "$data" "app"
 ensure_user "$runner" "$runner_uid" "$runner" "runner jobs"
 if id -nG "$runner" | tr ' ' '\n' | grep -qx "$data"; then gpasswd -d "$runner" "$data" >/dev/null; fi
 usermod -aG "$data,$dev" "$user"
+# container.services: each its own user and group (uid = gid), in no other group.
+svc_users=(@@SVC_USERS@@); svc_uids=(@@SVC_UIDS@@)
+for i in "${!svc_users[@]}"; do
+  ensure_group "${svc_users[$i]}" "${svc_uids[$i]}"
+  ensure_user "${svc_users[$i]}" "${svc_uids[$i]}" "${svc_users[$i]}" "service"
+done
 """
 
 # Readable by the dev group, so dev servers that call the API directly can use the token.
@@ -4135,6 +4319,81 @@ for w in "${want[@]}"; do
   systemctl enable "$w.socket" >/dev/null 2>&1
   systemctl restart "$w.socket"
 done
+"""
+
+# One container.services download: fetched by root, checked against the pinned sha256, unpacked as
+# nobody (an archive's paths can't reach outside the scratch folder), then made root-owned and
+# not writable by anyone else, and swapped in. Already installed from the same sha256: left alone.
+SERVICE_INSTALL = r"""
+url=@@URL@@; sha=@@SHA@@; dir=@@DIR@@; fname=@@FNAME@@; z=@@Z@@; archive=@@ARCHIVE@@; exe=@@EXE@@
+if [ -f "$dir/.devstack-sha256" ] && [ "$(cat "$dir/.devstack-sha256")" = "$sha" ] && [ -x "$dir/$exe" ]; then
+  echo "kept $dir"; exit 0
+fi
+work=$(mktemp -d /var/tmp/devstack-service.XXXXXX)
+trap 'rm -rf "$work"' EXIT
+chmod 755 "$work"
+curl -fsSL --proto '=https' --tlsv1.2 --retry 2 -o "$work/download" "$url"
+echo "$sha  $work/download" | sha256sum -c --strict - >/dev/null \
+  || { echo "sha256 mismatch for $url: got $(sha256sum "$work/download" | cut -d' ' -f1)" >&2; exit 1; }
+install -d -m 755 -o nobody -g nogroup "$work/out"
+if [ "$archive" = true ]; then
+  chmod 644 "$work/download"
+  runuser -u nobody -- bash -c 'umask 022; tar -x '"$z"' --no-same-owner -f "$0" -C "$1"' "$work/download" "$work/out"
+else
+  install -m 755 "$work/download" "$work/out/$fname"
+fi
+chown -R -h root:root "$work/out"
+chmod -R go-w "$work/out"
+chmod 755 "$work/out"
+real=$(readlink -f "$work/out/$exe" || true)
+case $real in "$work/out"/*) ;; *) echo "$exe is missing from the download (or points outside it)" >&2; exit 1 ;; esac
+[ -f "$real" ] && [ -x "$real" ] || { echo "$exe is not an executable file in the download" >&2; exit 1; }
+printf '%s\n' "$sha" >"$work/out/.devstack-sha256"
+install -d -m 755 "$(dirname "$dir")"
+rm -rf "$dir.old"
+if [ -e "$dir" ]; then mv "$dir" "$dir.old"; fi
+mv "$work/out" "$dir"
+rm -rf "$dir.old"
+echo "installed $dir"
+"""
+
+# Services removed from the config are stopped, their unit and download deleted (their user stays:
+# harmless, and files it owns on a mount keep a name). Then every configured one is (re)started.
+SERVICES_APPLY = r"""
+names=(@@NAMES@@); stack=@@STACK@@; root=@@ROOT@@
+list=/etc/devstack/services
+install -d -m 755 /etc/devstack
+if [ -f "$list" ]; then
+  while IFS= read -r old; do
+    [ -n "$old" ] || continue
+    keep=false
+    for n in "${names[@]}"; do [ "$n" = "$old" ] && keep=true; done
+    if [ "$keep" = false ]; then
+      systemctl disable --now "$stack-$old.service" >/dev/null 2>&1 || true
+      rm -f "/etc/systemd/system/$stack-$old.service"
+      rm -rf "${root:?}/$old"
+      echo "removed service $old"
+    fi
+  done < "$list"
+fi
+printf '%s\n' "${names[@]}" > "$list"
+systemctl daemon-reload
+for n in "${names[@]}"; do
+  u="$stack-$n.service"
+  systemctl enable "$u" >/dev/null 2>&1
+  systemctl restart "$u"
+done
+sleep 2
+for n in "${names[@]}"; do
+  u="$stack-$n.service"
+  if ! systemctl is-active --quiet "$u"; then journalctl -u "$u" -n 50 --no-pager >&2; echo "$u is not running" >&2; exit 1; fi
+done
+"""
+
+GPU_APPLY = r"""
+systemctl daemon-reload
+systemctl enable devstack-gpu.service >/dev/null 2>&1
+systemctl restart devstack-gpu.service
 """
 
 TOKEN_ENV_DROPIN = """\
@@ -4213,6 +4472,52 @@ fi
 """
 
 
+# container.services and the hidden GPU, checked as root like PROFILE_CHECK. A service's egress is probed
+# as its user; the GPU nodes must be unopenable for the container user and present in each GPU service's
+# own mount namespace (/proc/<pid>/root).
+SERVICE_CHECK = r"""
+user=@@USER@@; svc_users=(@@SVC_USERS@@); svc_profiles=(@@SVC_PROFILES@@); svc_ports=(@@SVC_PORTS@@)
+gpu_hidden=@@GPU_HIDDEN@@; gpu_units=(@@GPU_UNITS@@); hide=@@HIDE_DIR@@; known=(@@GPU_NODES@@)
+fail() { echo "$*" >&2; exit 1; }
+probe() { runuser -u "$1" -- timeout 4 bash -c 'exec 3<>"/dev/tcp/$0/$1"' "$2" "$3" 2>/dev/null; }
+for i in "${!svc_users[@]}"; do
+  u=${svc_users[$i]}
+  if [ "${svc_profiles[$i]}" = local ]; then
+    ! probe "$u" 1.1.1.1 443 || fail "$u reached 1.1.1.1:443 although its profile is local"
+  else
+    probe "$u" 1.1.1.1 443 || echo "warning: $u can't reach 1.1.1.1:443 (no internet from the container?)" >&2
+  fi
+  port=${svc_ports[$i]}
+  [ "$port" != 0 ] || continue
+  for _ in $(seq 1 30); do [ -n "$(ss -Htln "sport = :$port")" ] && break; sleep 1; done
+  lines=$(ss -Htln "sport = :$port")
+  [ -n "$lines" ] || fail "service $u: nothing listens on port $port after 30s"
+  if echo "$lines" | awk '{print $4}' | grep -vqE '^(127\.0\.0\.1|\[::1\]):'; then
+    fail "service $u: port $port is listening on a non-loopback address: $lines"
+  fi
+done
+[ "$gpu_hidden" = true ] || exit 0
+systemctl is-active --quiet devstack-gpu.service || fail "devstack-gpu.service is not active: the GPU is not hidden"
+names=()
+for f in "$hide"/*; do names+=("${f##*/}"); done
+[ "${#names[@]}" -gt 0 ] || echo "warning: gpu.enabled, but the container had no GPU device nodes to hide" >&2
+for n in "${names[@]}"; do
+  if runuser -u "$user" -- bash -c ': < "$0"' "/dev/$n" 2>/dev/null || runuser -u "$user" -- ls "/dev/$n/" >/dev/null 2>&1; then
+    fail "$user can still open /dev/$n"
+  fi
+done
+for unit in "${gpu_units[@]}"; do
+  pid=$(systemctl show -P MainPID "$unit")
+  [ -n "$pid" ] && [ "$pid" != 0 ] || fail "$unit has no main process"
+  for n in "${names[@]}"; do
+    [[ " ${known[*]} " == *" $n "* ]] || { echo "warning: GPU services don't get /dev/$n (not a node devstack binds)" >&2; continue; }
+    d="/proc/$pid/root/dev/$n"
+    [ -c "$d" ] || { [ -d "$d" ] && [ -n "$(ls -A "$d")" ]; } || fail "$unit doesn't see /dev/$n"
+  done
+done
+"""
+
+
 def nameservers(resolv_conf: str) -> list[str]:
     """The nameserver addresses in a resolv.conf."""
     out = []
@@ -4233,6 +4538,8 @@ def egress_nft(c: Config, resolvers: list[str]) -> str:
     rules = [f"\t\tmeta skuid {ids['app_uid']} jump {chain}  # {app}: app.profile = \"{profile}\"" if chain else
              f"\t\t# {app} ({ids['app_uid']}): app.profile = \"open\", not restricted",
              f"\t\tmeta skuid {ids['runner_uid']} jump internet_only  # {runner}: runner jobs"]
+    rules += [f"\t\tmeta skuid {uid} jump {'local_only' if s['profile'] == 'local' else 'local_internet'}  "
+              f"# {service_user(c, s)}: service, profile \"{s['profile']}\"" for s, uid in service_uids(c)]
     dns = [f"\t\t{'ip' if ipaddress.ip_address(r).version == 4 else 'ip6'} daddr {r} "
            "meta l4proto { tcp, udp } th dport 53 accept" for r in resolvers]
     return render("system/egress.nft", {
@@ -4258,11 +4565,43 @@ def runner_units(c: Config, tv: dict[str, Any]) -> dict[str, str]:
     return out
 
 
+def service_units(c: Config, tv: dict[str, Any]) -> dict[str, str]:
+    """Container path -> content of every container.services unit."""
+    out = {}
+    hidden = gpu_hidden(c)
+    for s, _uid in service_uids(c):
+        user = service_user(c, s)
+        if s["gpu"]:
+            device = ["# GPU: not PrivateDevices= (it would hide the device nodes) and not ProcSubset=pid",
+                      "# (the NVIDIA libraries read /proc/driver/nvidia)."]
+            if hidden:
+                device += ["# The nodes devstack-gpu.service hid from the rest of the container, bound back",
+                           "# in for this service only (each optional: only what this machine has).",
+                           *(f"BindPaths=-{GPU_HIDE_DIR}/{n}:/dev/{n}" for n in GPU_NODES)]
+            else:
+                device.append("# gpu.login_user = true: the nodes are visible to the whole container anyway.")
+        else:
+            device = ["PrivateDevices=yes", "ProcSubset=pid"]
+        out[f"/etc/systemd/system/{user}.service"] = render("system/service.service", {
+            **tv, "NAME": s["name"], "USER": user, "URL": s["url"], "SHA256": s["sha256"],
+            "DIR": f"{SERVICE_ROOT}/{s['name']}", "COMMAND": s["command"], "STATE_DIR": f"/var/lib/{user}",
+            "PROFILE": s["profile"],
+            "GPU_UNIT": " devstack-gpu.service" if s["gpu"] and hidden else "",
+            "ENV_LINES": "\n".join(f"Environment={k}={x}" for k, x in s["env"].items()) or "# no env",
+            "MEMORY_LINES": f"MemoryMax={s['memory_max']}" if s["memory_max"] else "# no memory_max",
+            "WRITE_LINES": "\n".join(f"ReadWritePaths={p}" for p in s["write_paths"]) or "# no write_paths",
+            "DEVICE_LINES": "\n".join(device),
+        })
+    return out
+
+
 def devstack_sync_script(c: Config) -> str:
     return render("system/devstack-sync", {
         "STACK": c["stack.name"],
         "APP_UNIT": shlex.quote(f"{c['app.service_name']}.service"),
         "RUNNER_SOCKETS": " ".join(shlex.quote(f"{runner_unit(c, r)}.socket") for r in c["app.runners"]),
+        "SERVICE_UNITS": " ".join(shlex.quote(f"{service_user(c, s)}.service") for s in c["container.services"]),
+        "GPU_UNIT": shlex.quote("devstack-gpu.service" if gpu_hidden(c) else ""),
     })
 
 
@@ -4292,7 +4631,8 @@ class IsolationPhase(Phase):
     layer = "isolation"
 
     def deny_ports(self, c: Config) -> list[int]:
-        ports = [*c["firewall.deny"], c["app.port"], *(r["port"] for r in c["app.runners"])]
+        ports = [*c["firewall.deny"], c["app.port"], *(r["port"] for r in c["app.runners"]),
+                 *(s["port"] for s in c["container.services"] if "port" in s)]
         if c["postgres.enabled"]:
             ports.append(c["postgres.port"])
         return sorted(set(ports))
@@ -4306,6 +4646,13 @@ class IsolationPhase(Phase):
         data = {"volume": f"incus volume {c['container.storage_pool']}/{c['app.data_volume']} (kept on undo)",
                 "host": f"host folder {c['app.data_source']}", "none": None}[c["app.data"]]
         runners = ", ".join(f"{r['name']} (127.0.0.1:{r['port']}: {r['command']})" for r in c["app.runners"])
+        services = [f"service {s['name']}: {s['url']} (sha256 {s['sha256'][:12]}...) -> {SERVICE_ROOT}/{s['name']}, "
+                    f"`{s['command']}` as {service_user(c, s)} ({uid}), profile '{s['profile']}'"
+                    + (f", 127.0.0.1:{s['port']}" if "port" in s else "") + (", GPU" if s["gpu"] else "")
+                    for s, uid in service_uids(c)]
+        gpu = (["GPU device nodes hidden from everything in the container at boot (devstack-gpu.service); "
+                "only services with gpu = true get them"] if gpu_hidden(c) else
+               ["GPU: usable by everyone in the container (gpu.login_user = true)"] if c["gpu.enabled"] else [])
         return [
             fw,
             f"users {c['isolation.app_user']} ({ids['app_uid']}), {c['isolation.runner_user']} ({ids['runner_uid']}); "
@@ -4322,11 +4669,15 @@ class IsolationPhase(Phase):
             f"systemd unit {unit}.service from templates/system/app.service (User={c['isolation.app_user']}, "
             "ProtectSystem=strict, ...); copy in infra/; enable --now",
             f"runners: {runners}" if runners else "runners: none",
+            *(services or ["services: none"]),
+            *gpu,
             f"/usr/local/sbin/devstack-sync; sudo for {c['container.user']}: {c['container.sudo']}",
             f"`devstack-sync packages` < {APT_LIST} (the project's apt packages; a failure only warns)",
             f"verify: {c['app.port']} on loopback only, direct call without token -> 500, "
             f"https://{c.dev_host}/api/health -> 200, no Server header, egress profiles per user, "
-            "Caddy admin off TCP, sudo, app data permissions",
+            "Caddy admin off TCP, sudo, app data permissions"
+            + (", services on loopback" if services else "")
+            + (f", {c['container.user']} can't open the GPU, GPU services can" if gpu_hidden(c) else ""),
         ]
 
     def apply(self, ctx: Ctx) -> None:
@@ -4341,7 +4692,8 @@ class IsolationPhase(Phase):
         ctx.cexec(bash(ACCOUNTS, STACK=c["stack.name"], USER=c["container.user"], APP=c["isolation.app_user"],
                        RUNNER=c["isolation.runner_user"], DATA=c["isolation.data_group"], DEV=c["isolation.dev_group"],
                        APP_UID=ids["app_uid"], RUNNER_UID=ids["runner_uid"], DATA_GID=ids["data_gid"],
-                       DEV_GID=ids["dev_gid"]))
+                       DEV_GID=ids["dev_gid"], SVC_USERS=[service_user(c, s) for s, _ in service_uids(c)],
+                       SVC_UIDS=[uid for _, uid in service_uids(c)]))
 
         token = secrets.token_hex(32)
         REDACT.add(token)
@@ -4379,9 +4731,35 @@ class IsolationPhase(Phase):
         if c["app.runners"]:
             log.info("  runners: %s", ", ".join(f"{runner_unit(c, r)}.socket" for r in c["app.runners"]))
 
+        if gpu_hidden(c):
+            log.info("  hiding the GPU device nodes (devstack-gpu.service)")
+            ctx.cwrite(GPU_HIDE_PATH, render("system/devstack-gpu", {**tv, "HIDE_DIR": GPU_HIDE_DIR}), mode="0755")
+            ctx.cwrite("/etc/systemd/system/devstack-gpu.service", render("system/devstack-gpu.service", tv))
+            ctx.cexec(GPU_APPLY, stream=True)
+        self._services(ctx, tv)
+
         apply_sudo(ctx)
         log.info("  sudo for %s: %s", c["container.user"], c["container.sudo"])
         ctx.state.set_fact("runners", c["app.runners"])
+        ctx.state.set_fact("services", c["container.services"])
+        ctx.state.set_fact("gpu_hidden", gpu_hidden(c))
+
+    def _services(self, ctx: Ctx, tv: dict[str, Any]) -> None:
+        c = ctx.cfg
+        if any(service_download(s["url"])[1] == "--zstd" for s in c["container.services"]):
+            ctx.apt_install("zstd")
+        for s in c["container.services"]:
+            fname, z = service_download(s["url"])
+            log.info("  service %s: %s", s["name"], s["url"])
+            res = ctx.cexec(bash(SERVICE_INSTALL, URL=s["url"], SHA=s["sha256"], DIR=f"{SERVICE_ROOT}/{s['name']}",
+                                 FNAME=fname, Z=z or "", ARCHIVE=z is not None, EXE=s["command"].split()[0]))
+            log.info("    %s", res.stdout.strip().splitlines()[-1] if res.stdout.strip() else "?")
+        for path, text in service_units(c, tv).items():
+            ctx.cwrite(path, text)
+        ctx.cexec(bash(SERVICES_APPLY, NAMES=[s["name"] for s in c["container.services"]], STACK=c["stack.name"],
+                       ROOT=SERVICE_ROOT))
+        if c["container.services"]:
+            log.info("  services: %s", ", ".join(f"{service_user(c, s)}.service" for s in c["container.services"]))
 
     def _app_data(self, ctx: Ctx) -> None:
         c = ctx.cfg
@@ -4414,6 +4792,19 @@ class IsolationPhase(Phase):
                 log.warning("%s", ln[len("warning: "):])
         expect(p.returncode == 0, p.stderr.strip())
         log.info("  egress profiles, Caddy admin socket, sudo and app data permissions OK")
+        if c["container.services"] or gpu_hidden(c):
+            svcs = service_uids(c)
+            p = ctx.cexec(bash(SERVICE_CHECK, USER=c["container.user"],
+                               SVC_USERS=[service_user(c, s) for s, _ in svcs],
+                               SVC_PROFILES=[s["profile"] for s, _ in svcs],
+                               SVC_PORTS=[s.get("port", 0) for s, _ in svcs], GPU_HIDDEN=gpu_hidden(c),
+                               GPU_UNITS=[f"{service_user(c, s)}.service" for s, _ in svcs if s["gpu"]],
+                               HIDE_DIR=GPU_HIDE_DIR, GPU_NODES=list(GPU_NODES)), check=False)
+            for ln in p.stderr.strip().splitlines():
+                if ln.startswith("warning: "):
+                    log.warning("%s", ln[len("warning: "):])
+            expect(p.returncode == 0, p.stderr.strip())
+            log.info("  services%s OK", f" and GPU access ({c['container.user']}: none)" if gpu_hidden(c) else "")
         p = host_curl(ctx, f"https://{c.dev_host}/api/health", "-f", "-D", "-")
         expect(p.returncode == 0, f"https://{c.dev_host}/api/health failed: {p.stderr.strip()}")
         expect('"ok":true' in p.stdout, f"unexpected /api/health response: {p.stdout[-300:]}")
@@ -4965,6 +5356,21 @@ def preflight_isolation(ctx: Ctx, rep: Report, ids: set[str]) -> None:
         changed = [r for r in c["app.runners"] if old.get(r["name"]) != r]
         rep.risks.append("new or changed runners run project code as a service with internet access:\n      "
                          + "\n      ".join(f"{r['name']}: `{r['command']}` on 127.0.0.1:{r['port']}" for r in changed))
+    applied = ctx.state.fact("services")
+    if c["container.services"] and c["container.services"] != applied:
+        old = {s["name"]: s for s in applied or []}
+        changed = [s for s in c["container.services"] if old.get(s["name"]) != s]
+        rep.risks.append("new or changed services run a downloaded program as a long-running service:\n      "
+                         + "\n      ".join(f"{s['name']}: {s['url']} (sha256 {s['sha256']}), `{s['command']}`, "
+                                           f"profile '{s['profile']}'" + (", GPU" if s["gpu"] else "")
+                                           for s in changed))
+    if c["gpu.enabled"] and c["gpu.login_user"]:
+        rep.warnings.append("gpu.login_user = true: everything in the container, agents included, can open the GPU "
+                            "devices, whose driver runs in the host's kernel")
+    done = ctx.state.status("isolation") == "done" and "isolation" not in ids
+    if done and (c["container.services"] != (applied or []) or gpu_hidden(c) != bool(ctx.state.fact("gpu_hidden"))):
+        rep.warnings.append("container.services or gpu.login_user changed since isolation ran; they apply with "
+                            "`devstack up --redo isolation`")
     if c["network.acl"] and "base" in ids or acl_pending(ctx):
         name = c["network.acl_name"]
         info = ctx.iq("/1.0") or {}
